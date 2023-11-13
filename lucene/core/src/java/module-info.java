@@ -19,7 +19,7 @@ import org.apache.lucene.codecs.lucene95.Lucene95Codec;
 import org.apache.lucene.codecs.lucene95.Lucene95HnswVectorsFormat;
 
 /** Lucene Core. */
-@SuppressWarnings("module") // the test framework is compiled after the core...
+@SuppressWarnings({"module", "requires-automatic"})
 module org.apache.lucene.core {
   requires java.logging;
   requires static jdk.unsupported; // this is optional but without it MMapDirectory won't be enabled
@@ -85,4 +85,7 @@ module org.apache.lucene.core {
   uses org.apache.lucene.codecs.KnnVectorsFormat;
   uses org.apache.lucene.codecs.PostingsFormat;
   uses org.apache.lucene.index.SortFieldProvider;
+
+  requires markdowngenerator;
+  requires info.picocli;
 }
