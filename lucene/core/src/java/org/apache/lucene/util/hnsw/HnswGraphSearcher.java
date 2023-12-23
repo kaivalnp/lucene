@@ -20,6 +20,9 @@ package org.apache.lucene.util.hnsw;
 import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.Locale;
+import java.util.Queue;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.TopKnnCollector;
 import org.apache.lucene.util.BitSet;
@@ -103,6 +106,40 @@ public class HnswGraphSearcher {
     int ep = graphSearcher.findBestEntryPoint(scorer, graph, knnCollector);
     if (ep != -1) {
       graphSearcher.searchLevel(knnCollector, scorer, 0, new int[] {ep}, graph, acceptOrds);
+
+      // knnCollector.k() is 1 for a VectorSimilarityCollector, do not run this snippet for other
+      // collectors
+      if (knnCollector.k() == 1) {
+        FixedBitSet visited = new FixedBitSet(graph.size());
+        Queue<Integer> candidates = new ArrayDeque<>();
+        candidates.add(graph.entryNode());
+
+        while (!candidates.isEmpty()) {
+          int node = candidates.remove();
+          if (visited.getAndSet(node)) {
+            continue;
+          }
+          graph.seek(0, node);
+
+          int neighbor;
+          while ((neighbor = graph.nextNeighbor()) != NO_MORE_DOCS) {
+            candidates.add(neighbor);
+          }
+        }
+
+        System.out.printf(
+            Locale.ROOT,
+            "Total Nodes = %3d, Reachable Nodes = %3d\n\nUnreachable Nodes:\n",
+            visited.length(),
+            visited.cardinality());
+        for (int i = 0; i < visited.length(); i++) {
+          if (!visited.get(i)) {
+            System.out.printf(
+                Locale.ROOT, "Doc = %d, Score = %f\n", scorer.ordToDoc(i), scorer.score(i));
+          }
+        }
+        System.out.println();
+      }
     }
   }
 

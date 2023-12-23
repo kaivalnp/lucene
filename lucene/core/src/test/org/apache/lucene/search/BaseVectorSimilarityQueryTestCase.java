@@ -374,6 +374,7 @@ abstract class BaseVectorSimilarityQueryTestCase<
 
     // Find score above which we get (at least) numAccepted vectors
     float resultSimilarity = getSimilarity(vectors, queryVector, numAccepted);
+    System.out.printf(Locale.ROOT, "Similarity = %f\n", resultSimilarity);
 
     // Cache scores of vectors
     Map<Integer, Float> scores = new HashMap<>();
@@ -383,6 +384,7 @@ abstract class BaseVectorSimilarityQueryTestCase<
         scores.put(i, score);
       }
     }
+    Map<Integer, Float> scoresCopy = new HashMap<>(scores);
 
     try (Directory indexStore = getIndexStore(vectors);
         IndexReader reader = DirectoryReader.open(indexStore)) {
@@ -397,10 +399,13 @@ abstract class BaseVectorSimilarityQueryTestCase<
 
         // Check that the collected result is above accepted similarity
         assertTrue(scores.containsKey(id));
+        scoresCopy.remove(id);
 
         // Check that the score is correct
         assertEquals(scores.get(id), scoreDoc.score, delta);
       }
+
+      System.out.printf(Locale.ROOT, "Missed Docs = %s\n\n", scoresCopy);
 
       // Check that all results are collected
       assertEquals(scores.size(), scoreDocs.length);
