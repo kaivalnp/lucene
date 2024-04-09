@@ -303,7 +303,8 @@ public final class Lucene94FieldInfosFormat extends FieldInfosFormat {
           VectorSimilarityFunction.EUCLIDEAN,
           VectorSimilarityFunction.DOT_PRODUCT,
           VectorSimilarityFunction.COSINE,
-          VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT);
+          VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT,
+          VectorSimilarityFunction.GIP);
 
   static VectorSimilarityFunction distOrdToFunc(byte i) {
     if (i < 0 || i >= SIMILARITY_FUNCTIONS.size()) {

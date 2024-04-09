@@ -188,7 +188,8 @@ public final class Lucene99HnswVectorsReader extends KnnVectorsReader
           VectorSimilarityFunction.EUCLIDEAN,
           VectorSimilarityFunction.DOT_PRODUCT,
           VectorSimilarityFunction.COSINE,
-          VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT);
+          VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT,
+          VectorSimilarityFunction.GIP);
 
   public static VectorSimilarityFunction readSimilarityFunction(DataInput input)
       throws IOException {

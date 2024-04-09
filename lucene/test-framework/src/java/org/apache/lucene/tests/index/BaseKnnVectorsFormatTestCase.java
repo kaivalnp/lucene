@@ -1313,7 +1313,8 @@ public abstract class BaseKnnVectorsFormatTestCase extends BaseIndexFileFormatTe
     assertEquals(1, VectorSimilarityFunction.DOT_PRODUCT.ordinal());
     assertEquals(2, VectorSimilarityFunction.COSINE.ordinal());
     assertEquals(3, VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.ordinal());
-    assertEquals(4, VectorSimilarityFunction.values().length);
+    assertEquals(4, VectorSimilarityFunction.GIP.ordinal());
+    assertEquals(5, VectorSimilarityFunction.values().length);
   }
 
   public void testVectorEncodingOrdinals() {

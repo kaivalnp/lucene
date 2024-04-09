@@ -94,6 +94,25 @@ public enum VectorSimilarityFunction {
     public float compare(byte[] v1, byte[] v2) {
       return scaleMaxInnerProductScore(dotProduct(v1, v2));
     }
+  },
+
+  /** Placeholder javadocs. */
+  GIP {
+    @Override
+    public float compare(byte[] v1, byte[] v2) {
+      return 0;
+    }
+
+    @Override
+    public float compare(float[] v1, float[] v2) {
+      float score = 0;
+      for (int i = 0; i < v1.length / 2; i++) {
+        if (v1[i + v1.length / 2] == v2[i + v1.length / 2]) {
+          score += v1[i] * v2[i];
+        }
+      }
+      return score;
+    }
   };
 
   /**

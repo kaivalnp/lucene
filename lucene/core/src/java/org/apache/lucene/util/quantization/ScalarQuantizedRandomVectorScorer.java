@@ -37,7 +37,7 @@ public class ScalarQuantizedRandomVectorScorer
       ScalarQuantizer scalarQuantizer) {
     float[] processedQuery =
         switch (similarityFunction) {
-          case EUCLIDEAN, DOT_PRODUCT, MAXIMUM_INNER_PRODUCT -> query;
+          case EUCLIDEAN, DOT_PRODUCT, MAXIMUM_INNER_PRODUCT, GIP -> query;
           case COSINE -> {
             float[] queryCopy = ArrayUtil.copyOfSubArray(query, 0, query.length);
             VectorUtil.l2normalize(queryCopy);
