@@ -14,9 +14,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-@SuppressWarnings({"requires-automatic"})
+@SuppressWarnings({"module", "requires-automatic"})
 module org.apache.lucene.benchmark {
   requires java.xml;
+  requires org.apache.lucene.backward_codecs;
   requires org.apache.lucene.core;
   requires org.apache.lucene.analysis.common;
   requires org.apache.lucene.facet;
@@ -28,6 +29,8 @@ module org.apache.lucene.benchmark {
   requires org.apache.commons.compress;
   requires nekohtml;
   requires com.ibm.icu;
+  requires markdowngenerator;
+  requires info.picocli;
 
   exports org.apache.lucene.benchmark;
   exports org.apache.lucene.benchmark.byTask;
