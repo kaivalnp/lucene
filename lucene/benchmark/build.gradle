@@ -48,6 +48,11 @@ dependencies {
   moduleRuntimeOnly project(':lucene:analysis:icu')
 
   moduleTestImplementation project(':lucene:test-framework')
+
+  moduleImplementation project(':lucene:backward-codecs')
+  moduleImplementation "net.steppschuh.markdowngenerator:markdowngenerator:1.3.1.1"
+  moduleImplementation "info.picocli:picocli:4.7.5"
+  annotationProcessor "info.picocli:picocli-codegen:4.7.5"
 }
 
 // We add 'conf' to resources because we validate *.alg script correctness in one of the tests.
@@ -76,4 +81,10 @@ task run(type: JavaExec) {
     port = 5005
     suspend = true
   }
+}
+
+task "recall-tool" (type: JavaExec) {
+  mainClass = "org.apache.lucene.benchmark.knn.RecallTool"
+  classpath sourceSets.main.runtimeClasspath
+  jvmArgs "--add-modules", "jdk.incubator.vector", "-Djava.util.concurrent.ForkJoinPool.common.parallelism=80"
 }
