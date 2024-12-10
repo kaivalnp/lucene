@@ -17,6 +17,8 @@
 
 package org.apache.lucene.search;
 
+import org.apache.lucene.util.hnsw.NeighborQueue;
+
 /**
  * KnnCollector is a knn collector used for gathering kNN results and providing topDocs from the
  * gathered neighbors
@@ -85,4 +87,8 @@ public interface KnnCollector {
    * @return The collected top documents
    */
   TopDocs topDocs();
+
+  default NeighborQueue candidates() {
+    return new NeighborQueue(k(), true);
+  }
 }
