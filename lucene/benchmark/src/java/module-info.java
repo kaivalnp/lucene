@@ -28,6 +28,9 @@ module org.apache.lucene.benchmark {
   requires org.apache.commons.compress;
   requires nekohtml;
   requires com.ibm.icu;
+  requires org.apache.lucene.backward_codecs;
+  requires info.picocli;
+  requires markdowngenerator;
 
   exports org.apache.lucene.benchmark;
   exports org.apache.lucene.benchmark.byTask;
