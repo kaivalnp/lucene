@@ -1,0 +1,33 @@
+name: "Run Faiss tests in the sandbox module"
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - '*'
+
+  push:
+    branches:
+      - 'main'
+      - 'branch_10x'
+
+jobs:
+  build-faiss:
+    name: Build Faiss
+    uses: facebookresearch/faiss/.github/workflows/build.yml@main
+
+  run-faiss-tests:
+    name: Run Faiss tests in the sandbox module
+    timeout-minutes: 15
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-for-build
+
+      - name: Run Faiss tests in the sandbox module
+        run: ./gradlew -p lucene/sandbox test --tests "org.apache.lucene.sandbox.codecs.faiss.*"
+
+    needs: build-faiss
