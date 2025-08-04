@@ -52,7 +52,7 @@ import org.apache.lucene.util.SuppressForbidden;
  *
  * Setting these properties will make this code run EXTREMELY slow!
  */
-final class PanamaVectorUtilSupport implements VectorUtilSupport {
+final class PanamaVectorUtilSupport implements MemorySegmentVectorUtilSupport {
 
   // preferred vector sizes, which can be altered for testing
   private static final VectorSpecies<Float> FLOAT_SPECIES;
@@ -311,8 +311,6 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
   // This is slower but still faster than not vectorizing at all.
 
   private interface ByteVectorLoader {
-    int length();
-
     ByteVector load(VectorSpecies<Byte> species, int index);
 
     byte tail(int index);
@@ -320,78 +318,79 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
 
   private record ArrayLoader(byte[] arr) implements ByteVectorLoader {
     @Override
-    public int length() {
-      return arr.length;
-    }
-
-    @Override
     public ByteVector load(VectorSpecies<Byte> species, int index) {
-      assert index + species.length() <= length();
+      assert index + species.length() <= arr.length;
       return ByteVector.fromArray(species, arr, index);
     }
 
     @Override
     public byte tail(int index) {
-      assert index <= length();
+      assert index <= arr.length;
       return arr[index];
     }
   }
 
   private record MemorySegmentLoader(MemorySegment segment) implements ByteVectorLoader {
     @Override
-    public int length() {
-      return Math.toIntExact(segment.byteSize());
-    }
-
-    @Override
     public ByteVector load(VectorSpecies<Byte> species, int index) {
-      assert index + species.length() <= length();
+      assert index + species.length() <= segment.byteSize();
       return ByteVector.fromMemorySegment(species, segment, index, LITTLE_ENDIAN);
     }
 
     @Override
     public byte tail(int index) {
-      assert index <= length();
+      assert index <= segment.byteSize();
       return segment.get(JAVA_BYTE, index);
     }
   }
 
   @Override
   public int dotProduct(byte[] a, byte[] b) {
-    return dotProductBody(new ArrayLoader(a), new ArrayLoader(b));
+    assert a.length == b.length;
+    return dotProductBody(new ArrayLoader(a), new ArrayLoader(b), a.length);
   }
 
-  public static int dotProduct(byte[] a, MemorySegment b) {
-    return dotProductBody(new ArrayLoader(a), new MemorySegmentLoader(b));
+  @Override
+  public int dotProduct(byte[] a, MemorySegment b) {
+    assert a.length == b.byteSize();
+    return dotProductBody(new ArrayLoader(a), new MemorySegmentLoader(b), a.length);
   }
 
-  public static int dotProduct(MemorySegment a, MemorySegment b) {
-    return dotProductBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b));
+  @Override
+  public int dotProduct(MemorySegment a, MemorySegment b) {
+    assert a.byteSize() == b.byteSize();
+    return dotProduct(a, b, Math.toIntExact(a.byteSize()));
   }
 
-  private static int dotProductBody(ByteVectorLoader a, ByteVectorLoader b) {
-    assert a.length() == b.length();
+  @Override
+  public int dotProduct(MemorySegment a, MemorySegment b, int limit) {
+    assert a.byteSize() >= limit;
+    assert b.byteSize() >= limit;
+    return dotProductBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b), limit);
+  }
+
+  private static int dotProductBody(ByteVectorLoader a, ByteVectorLoader b, int limit) {
     int i = 0;
     int res = 0;
 
     // only vectorize if we'll at least enter the loop a single time
-    if (a.length() >= 16) {
+    if (limit >= 16) {
       // compute vectorized dot product consistent with VPDPBUSD instruction
       if (VECTOR_BITSIZE >= 512) {
-        i += BYTE_SPECIES.loopBound(a.length());
+        i += BYTE_SPECIES.loopBound(limit);
         res += dotProductBody512(a, b, i);
       } else if (VECTOR_BITSIZE == 256) {
-        i += BYTE_SPECIES.loopBound(a.length());
+        i += BYTE_SPECIES.loopBound(limit);
         res += dotProductBody256(a, b, i);
       } else {
         // tricky: we don't have SPECIES_32, so we workaround with "overlapping read"
-        i += ByteVector.SPECIES_64.loopBound(a.length() - ByteVector.SPECIES_64.length());
+        i += ByteVector.SPECIES_64.loopBound(limit - ByteVector.SPECIES_64.length());
         res += dotProductBody128(a, b, i);
       }
     }
 
     // scalar tail
-    for (; i < a.length(); i++) {
+    for (; i < limit; i++) {
       res += a.tail(i) * b.tail(i);
     }
     return res;
@@ -632,35 +631,47 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
 
   @Override
   public float cosine(byte[] a, byte[] b) {
-    return cosineBody(new ArrayLoader(a), new ArrayLoader(b));
+    assert a.length == b.length;
+    return cosineBody(new ArrayLoader(a), new ArrayLoader(b), a.length);
   }
 
-  public static float cosine(MemorySegment a, MemorySegment b) {
-    return cosineBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b));
+  @Override
+  public float cosine(byte[] a, MemorySegment b) {
+    assert a.length == b.byteSize();
+    return cosineBody(new ArrayLoader(a), new MemorySegmentLoader(b), a.length);
   }
 
-  public static float cosine(byte[] a, MemorySegment b) {
-    return cosineBody(new ArrayLoader(a), new MemorySegmentLoader(b));
+  @Override
+  public float cosine(MemorySegment a, MemorySegment b) {
+    assert a.byteSize() == b.byteSize();
+    return dotProduct(a, b, Math.toIntExact(a.byteSize()));
   }
 
-  private static float cosineBody(ByteVectorLoader a, ByteVectorLoader b) {
+  @Override
+  public float cosine(MemorySegment a, MemorySegment b, int limit) {
+    assert a.byteSize() >= limit;
+    assert b.byteSize() >= limit;
+    return cosineBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b), limit);
+  }
+
+  private static float cosineBody(ByteVectorLoader a, ByteVectorLoader b, int limit) {
     int i = 0;
     int sum = 0;
     int norm1 = 0;
     int norm2 = 0;
 
     // only vectorize if we'll at least enter the loop a single time
-    if (a.length() >= 16) {
+    if (limit >= 16) {
       final float[] ret;
       if (VECTOR_BITSIZE >= 512) {
-        i += BYTE_SPECIES.loopBound(a.length());
+        i += BYTE_SPECIES.loopBound(limit);
         ret = cosineBody512(a, b, i);
       } else if (VECTOR_BITSIZE == 256) {
-        i += BYTE_SPECIES.loopBound(a.length());
+        i += BYTE_SPECIES.loopBound(limit);
         ret = cosineBody256(a, b, i);
       } else {
         // tricky: we don't have SPECIES_32, so we workaround with "overlapping read"
-        i += ByteVector.SPECIES_64.loopBound(a.length() - ByteVector.SPECIES_64.length());
+        i += ByteVector.SPECIES_64.loopBound(limit - ByteVector.SPECIES_64.length());
         ret = cosineBody128(a, b, i);
       }
       sum += ret[0];
@@ -669,7 +680,7 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
     }
 
     // scalar tail
-    for (; i < a.length(); i++) {
+    for (; i < limit; i++) {
       byte elem1 = a.tail(i);
       byte elem2 = b.tail(i);
       sum += elem1 * elem2;
@@ -763,35 +774,46 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
 
   @Override
   public int squareDistance(byte[] a, byte[] b) {
-    return squareDistanceBody(new ArrayLoader(a), new ArrayLoader(b));
+    assert a.length == b.length;
+    return squareDistanceBody(new ArrayLoader(a), new ArrayLoader(b), a.length);
   }
 
-  public static int squareDistance(MemorySegment a, MemorySegment b) {
-    return squareDistanceBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b));
+  @Override
+  public int squareDistance(byte[] a, MemorySegment b) {
+    assert a.length == b.byteSize();
+    return squareDistanceBody(new ArrayLoader(a), new MemorySegmentLoader(b), a.length);
   }
 
-  public static int squareDistance(byte[] a, MemorySegment b) {
-    return squareDistanceBody(new ArrayLoader(a), new MemorySegmentLoader(b));
+  @Override
+  public int squareDistance(MemorySegment a, MemorySegment b) {
+    assert a.byteSize() == b.byteSize();
+    return squareDistance(a, b, Math.toIntExact(a.byteSize()));
   }
 
-  private static int squareDistanceBody(ByteVectorLoader a, ByteVectorLoader b) {
-    assert a.length() == b.length();
+  @Override
+  public int squareDistance(MemorySegment a, MemorySegment b, int limit) {
+    assert a.byteSize() >= limit;
+    assert b.byteSize() >= limit;
+    return squareDistanceBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b), limit);
+  }
+
+  private static int squareDistanceBody(ByteVectorLoader a, ByteVectorLoader b, int limit) {
     int i = 0;
     int res = 0;
 
     // only vectorize if we'll at least enter the loop a single time
-    if (a.length() >= 16) {
+    if (limit >= 16) {
       if (VECTOR_BITSIZE >= 256) {
-        i += BYTE_SPECIES.loopBound(a.length());
+        i += BYTE_SPECIES.loopBound(limit);
         res += squareDistanceBody256(a, b, i);
       } else {
-        i += ByteVector.SPECIES_64.loopBound(a.length());
+        i += ByteVector.SPECIES_64.loopBound(limit);
         res += squareDistanceBody128(a, b, i);
       }
     }
 
     // scalar tail
-    for (; i < a.length(); i++) {
+    for (; i < limit; i++) {
       int diff = a.tail(i) - b.tail(i);
       res += diff * diff;
     }

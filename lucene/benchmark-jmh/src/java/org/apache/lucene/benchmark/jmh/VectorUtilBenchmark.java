@@ -109,6 +109,16 @@ public class VectorUtilBenchmark {
   }
 
   @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public float binaryCosineNative() {
+    return VectorUtil.cosine(bytesA, bytesB);
+  }
+
+  @Benchmark
   public int binaryDotProductScalar() {
     return VectorUtil.dotProduct(bytesA, bytesB);
   }
@@ -116,6 +126,16 @@ public class VectorUtilBenchmark {
   @Benchmark
   @Fork(jvmArgsPrepend = {"--add-modules=jdk.incubator.vector"})
   public int binaryDotProductVector() {
+    return VectorUtil.dotProduct(bytesA, bytesB);
+  }
+
+  @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public int binaryDotProductNative() {
     return VectorUtil.dotProduct(bytesA, bytesB);
   }
 
@@ -131,6 +151,16 @@ public class VectorUtilBenchmark {
   }
 
   @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public int binarySquareNative() {
+    return VectorUtil.squareDistance(bytesA, bytesB);
+  }
+
+  @Benchmark
   public int binaryHalfByteScalar() {
     return VectorUtil.int4DotProduct(halfBytesA, halfBytesB);
   }
@@ -138,6 +168,16 @@ public class VectorUtilBenchmark {
   @Benchmark
   @Fork(jvmArgsPrepend = {"--add-modules=jdk.incubator.vector"})
   public int binaryHalfByteVector() {
+    return VectorUtil.int4DotProduct(halfBytesA, halfBytesB);
+  }
+
+  @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public int binaryHalfByteNative() {
     return VectorUtil.int4DotProduct(halfBytesA, halfBytesB);
   }
 
@@ -156,6 +196,23 @@ public class VectorUtilBenchmark {
   @Benchmark
   @Fork(jvmArgsPrepend = {"--add-modules=jdk.incubator.vector"})
   public int binaryHalfByteVectorPacked() {
+    if (size % 2 != 0) {
+      throw new RuntimeException("Size must be even for this benchmark");
+    }
+    int v = VectorUtil.int4DotProductPacked(halfBytesA, halfBytesBPacked);
+    if (v != expectedhalfByteDotProduct) {
+      throw new RuntimeException("Expected " + expectedhalfByteDotProduct + " but got " + v);
+    }
+    return v;
+  }
+
+  @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public int binaryHalfByteNativePacked() {
     if (size % 2 != 0) {
       throw new RuntimeException("Size must be even for this benchmark");
     }
