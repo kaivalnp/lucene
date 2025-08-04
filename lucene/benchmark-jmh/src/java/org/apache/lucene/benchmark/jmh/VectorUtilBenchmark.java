@@ -109,6 +109,16 @@ public class VectorUtilBenchmark {
   }
 
   @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public float binaryCosineNative() {
+    return VectorUtil.cosine(bytesA, bytesB);
+  }
+
+  @Benchmark
   public int binaryDotProductScalar() {
     return VectorUtil.dotProduct(bytesA, bytesB);
   }
@@ -120,6 +130,16 @@ public class VectorUtilBenchmark {
   }
 
   @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public int binaryDotProductNative() {
+    return VectorUtil.dotProduct(bytesA, bytesB);
+  }
+
+  @Benchmark
   public int binarySquareScalar() {
     return VectorUtil.squareDistance(bytesA, bytesB);
   }
@@ -127,6 +147,16 @@ public class VectorUtilBenchmark {
   @Benchmark
   @Fork(jvmArgsPrepend = {"--add-modules=jdk.incubator.vector"})
   public int binarySquareVector() {
+    return VectorUtil.squareDistance(bytesA, bytesB);
+  }
+
+  @Benchmark
+  @Fork(
+      jvmArgsPrepend = {
+        "--add-modules=jdk.incubator.vector",
+        "-Dorg.apache.lucene.internal.vectorization.useNative=true"
+      })
+  public int binarySquareNative() {
     return VectorUtil.squareDistance(bytesA, bytesB);
   }
 

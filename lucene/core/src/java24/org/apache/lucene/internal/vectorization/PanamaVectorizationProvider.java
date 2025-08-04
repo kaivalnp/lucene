@@ -51,7 +51,7 @@ final class PanamaVectorizationProvider extends VectorizationProvider {
           "CPU type or flags do not guarantee support for fast integer vectorization");
     }
 
-    this.vectorUtilSupport = new PanamaVectorUtilSupport();
+    this.vectorUtilSupport = MemorySegmentVectorUtilSupport.INSTANCE;
 
     logIncubatorSetup();
   }
