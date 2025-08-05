@@ -27,6 +27,7 @@ import org.apache.lucene.codecs.lucene99.Lucene99ScalarQuantizedVectorScorer;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.MemorySegmentAccessInput;
+import org.apache.lucene.util.FloatToFloatFunction;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
@@ -81,7 +82,7 @@ class Lucene99MemorySegmentScalarQuantizedVectorScorer implements FlatVectorsSco
     private final int vectorByteSize;
     private final int nodeSize;
     private final Scorer scorer;
-    private final Scaler scaler;
+    private final FloatToFloatFunction scaler;
     private byte[] scratch;
 
     RandomVectorScorerBase(
@@ -162,7 +163,7 @@ class Lucene99MemorySegmentScalarQuantizedVectorScorer implements FlatVectorsSco
     float scoreBody(int ord, float queryOffset) throws IOException {
       checkOrdinal(ord);
       Node node = getNode(ord);
-      return scaler.scale(scorer.score(node.vector) * constMultiplier + node.offset + queryOffset);
+      return scaler.apply(scorer.score(node.vector) * constMultiplier + node.offset + queryOffset);
     }
 
     abstract int euclidean(MemorySegment doc);
@@ -182,11 +183,6 @@ class Lucene99MemorySegmentScalarQuantizedVectorScorer implements FlatVectorsSco
     @FunctionalInterface
     private interface Scorer {
       int score(MemorySegment doc) throws IOException;
-    }
-
-    @FunctionalInterface
-    private interface Scaler {
-      float scale(float score);
     }
   }
 
