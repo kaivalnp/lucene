@@ -229,12 +229,12 @@ class Lucene99MemorySegmentScalarQuantizedVectorScorer implements FlatVectorsSco
 
     @Override
     int int4DotProduct(MemorySegment doc) {
-      return PanamaVectorUtilSupport.int4DotProduct(targetBytes, false, doc, false);
+      return PanamaVectorUtilSupport.int4DotProduct(targetBytes, doc);
     }
 
     @Override
     int compressedInt4DotProduct(MemorySegment doc) {
-      return PanamaVectorUtilSupport.int4DotProduct(targetBytes, false, doc, true);
+      return PanamaVectorUtilSupport.int4DotProductSinglePacked(targetBytes, doc);
     }
   }
 
@@ -304,12 +304,12 @@ class Lucene99MemorySegmentScalarQuantizedVectorScorer implements FlatVectorsSco
 
     @Override
     int int4DotProduct(MemorySegment doc) {
-      return PanamaVectorUtilSupport.int4DotProduct(query, false, doc, false);
+      return PanamaVectorUtilSupport.int4DotProduct(query, doc);
     }
 
     @Override
     int compressedInt4DotProduct(MemorySegment doc) {
-      return PanamaVectorUtilSupport.int4DotProduct(query, true, doc, true);
+      return PanamaVectorUtilSupport.int4DotProductBothPacked(query, doc);
     }
   }
 }

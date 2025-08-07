@@ -454,72 +454,94 @@ final class PanamaVectorUtilSupport implements VectorUtilSupport {
   }
 
   @Override
-  public int int4DotProduct(byte[] a, boolean apacked, byte[] b, boolean bpacked) {
-    return int4DotProductBody(new ArrayLoader(a), apacked, new ArrayLoader(b), bpacked);
+  public int int4DotProduct(byte[] a, byte[] b) {
+    return int4DotProductBody(new ArrayLoader(a), new ArrayLoader(b));
   }
 
-  public static int int4DotProduct(
-      MemorySegment a, boolean apacked, MemorySegment b, boolean bpacked) {
-    return int4DotProductBody(
-        new MemorySegmentLoader(a), apacked, new MemorySegmentLoader(b), bpacked);
+  public static int int4DotProduct(byte[] a, MemorySegment b) {
+    return int4DotProductBody(new ArrayLoader(a), new MemorySegmentLoader(b));
   }
 
-  public static int int4DotProduct(byte[] a, boolean apacked, MemorySegment b, boolean bpacked) {
-    return int4DotProductBody(new ArrayLoader(a), apacked, new MemorySegmentLoader(b), bpacked);
+  public static int int4DotProduct(MemorySegment a, MemorySegment b) {
+    return int4DotProductBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b));
   }
 
-  private static int int4DotProductBody(
-      ByteVectorLoader a, boolean apacked, ByteVectorLoader b, boolean bpacked) {
+  private static int int4DotProductBody(ByteVectorLoader a, ByteVectorLoader b) {
     int i = 0;
     int res = 0;
-    if (apacked && bpacked) {
-      if (a.length() >= 32) {
-        i += DotProductPackedPackedConstants.BYTE_SPECIES.loopBound(a.length());
-        res += dotProductBodyPackedPacked(a, b, i);
-      }
-      // scalar tail
-      for (; i < a.length(); i++) {
-        byte aByte = a.tail(i);
-        byte bByte = b.tail(i);
-        res += (aByte & 0x0F) * (bByte & 0x0F);
-        res += ((aByte & 0xFF) >> 4) * ((bByte & 0xFF) >> 4);
-      }
-    } else if (apacked || bpacked) {
-      ByteVectorLoader packed = apacked ? a : b;
-      ByteVectorLoader unpacked = apacked ? b : a;
-      if (packed.length() >= 32) {
-        if (VECTOR_BITSIZE >= 512) {
-          i += ByteVector.SPECIES_256.loopBound(packed.length());
-          res += dotProductBody512Int4Packed(unpacked, packed, i);
-        } else if (VECTOR_BITSIZE == 256) {
-          i += ByteVector.SPECIES_128.loopBound(packed.length());
-          res += dotProductBody256Int4Packed(unpacked, packed, i);
-        } else {
-          i += ByteVector.SPECIES_64.loopBound(packed.length());
-          res += dotProductBody128Int4Packed(unpacked, packed, i);
-        }
-      }
-      // scalar tail
-      for (; i < packed.length(); i++) {
-        byte packedByte = packed.tail(i);
-        byte unpacked1 = unpacked.tail(i);
-        byte unpacked2 = unpacked.tail(i + packed.length());
-        res += (packedByte & 0x0F) * unpacked2;
-        res += ((packedByte & 0xFF) >> 4) * unpacked1;
-      }
-    } else {
-      if (VECTOR_BITSIZE >= 512 || VECTOR_BITSIZE == 256) {
-        return dotProductBody(a, b);
-      } else if (a.length() >= 32) {
-        i += ByteVector.SPECIES_128.loopBound(a.length());
-        res += int4DotProductBody128(a, b, i);
-      }
-      // scalar tail
-      for (; i < a.length(); i++) {
-        res += a.tail(i) * b.tail(i);
+    if (VECTOR_BITSIZE >= 512 || VECTOR_BITSIZE == 256) {
+      return dotProductBody(a, b);
+    } else if (a.length() >= 32) {
+      i += ByteVector.SPECIES_128.loopBound(a.length());
+      res += int4DotProductBody128(a, b, i);
+    }
+    // scalar tail
+    for (; i < a.length(); i++) {
+      res += a.tail(i) * b.tail(i);
+    }
+    return res;
+  }
+
+  @Override
+  public int int4DotProductSinglePacked(byte[] unpacked, byte[] packed) {
+    return int4DotProductSinglePackedBody(new ArrayLoader(unpacked), new ArrayLoader(packed));
+  }
+
+  public static int int4DotProductSinglePacked(byte[] unpacked, MemorySegment packed) {
+    return int4DotProductSinglePackedBody(
+        new ArrayLoader(unpacked), new MemorySegmentLoader(packed));
+  }
+
+  private static int int4DotProductSinglePackedBody(
+      ByteVectorLoader unpacked, ByteVectorLoader packed) {
+    int i = 0;
+    int res = 0;
+    if (packed.length() >= 32) {
+      if (VECTOR_BITSIZE >= 512) {
+        i += ByteVector.SPECIES_256.loopBound(packed.length());
+        res += dotProductBody512Int4Packed(unpacked, packed, i);
+      } else if (VECTOR_BITSIZE == 256) {
+        i += ByteVector.SPECIES_128.loopBound(packed.length());
+        res += dotProductBody256Int4Packed(unpacked, packed, i);
+      } else {
+        i += ByteVector.SPECIES_64.loopBound(packed.length());
+        res += dotProductBody128Int4Packed(unpacked, packed, i);
       }
     }
+    // scalar tail
+    for (; i < packed.length(); i++) {
+      byte packedByte = packed.tail(i);
+      byte unpacked1 = unpacked.tail(i);
+      byte unpacked2 = unpacked.tail(i + packed.length());
+      res += (packedByte & 0x0F) * unpacked2;
+      res += ((packedByte & 0xFF) >> 4) * unpacked1;
+    }
+    return res;
+  }
 
+  @Override
+  public int int4DotProductBothPacked(byte[] a, byte[] b) {
+    return int4DotProductBothPackedBody(new ArrayLoader(a), new ArrayLoader(b));
+  }
+
+  public static int int4DotProductBothPacked(MemorySegment a, MemorySegment b) {
+    return int4DotProductBothPackedBody(new MemorySegmentLoader(a), new MemorySegmentLoader(b));
+  }
+
+  private static int int4DotProductBothPackedBody(ByteVectorLoader a, ByteVectorLoader b) {
+    int i = 0;
+    int res = 0;
+    if (a.length() >= 32) {
+      i += DotProductPackedPackedConstants.BYTE_SPECIES.loopBound(a.length());
+      res += dotProductBodyPackedPacked(a, b, i);
+    }
+    // scalar tail
+    for (; i < a.length(); i++) {
+      byte aByte = a.tail(i);
+      byte bByte = b.tail(i);
+      res += (aByte & 0x0F) * (bByte & 0x0F);
+      res += ((aByte & 0xFF) >> 4) * ((bByte & 0xFF) >> 4);
+    }
     return res;
   }
 

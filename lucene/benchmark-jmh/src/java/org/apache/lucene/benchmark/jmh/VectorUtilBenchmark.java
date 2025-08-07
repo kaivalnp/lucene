@@ -150,7 +150,7 @@ public class VectorUtilBenchmark {
     if (size % 2 != 0) {
       throw new RuntimeException("Size must be even for this benchmark");
     }
-    int v = VectorUtil.int4DotProductPacked(halfBytesA, halfBytesBPacked);
+    int v = VectorUtil.int4DotProductSinglePacked(halfBytesA, halfBytesBPacked);
     if (v != expectedhalfByteDotProduct) {
       throw new RuntimeException("Expected " + expectedhalfByteDotProduct + " but got " + v);
     }
@@ -163,7 +163,7 @@ public class VectorUtilBenchmark {
     if (size % 2 != 0) {
       throw new RuntimeException("Size must be even for this benchmark");
     }
-    int v = VectorUtil.int4DotProductPacked(halfBytesA, halfBytesBPacked);
+    int v = VectorUtil.int4DotProductSinglePacked(halfBytesA, halfBytesBPacked);
     if (v != expectedhalfByteDotProduct) {
       throw new RuntimeException("Expected " + expectedhalfByteDotProduct + " but got " + v);
     }
@@ -175,7 +175,7 @@ public class VectorUtilBenchmark {
     if (size % 2 != 0) {
       throw new RuntimeException("Size must be even for this benchmark");
     }
-    return VectorUtil.int4DotProductPackedPacked(halfBytesAPacked, halfBytesBPacked);
+    return VectorUtil.int4DotProductBothPacked(halfBytesAPacked, halfBytesBPacked);
   }
 
   @Benchmark
@@ -184,7 +184,7 @@ public class VectorUtilBenchmark {
     if (size % 2 != 0) {
       throw new RuntimeException("Size must be even for this benchmark");
     }
-    return VectorUtil.int4DotProductPackedPacked(halfBytesAPacked, halfBytesBPacked);
+    return VectorUtil.int4DotProductBothPacked(halfBytesAPacked, halfBytesBPacked);
   }
 
   @Benchmark
