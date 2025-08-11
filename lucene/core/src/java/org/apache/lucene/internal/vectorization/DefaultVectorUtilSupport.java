@@ -158,7 +158,7 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
   }
 
   @Override
-  public int int4DotProductSinglePacked(byte[] packed, byte[] unpacked) {
+  public int int4DotProductSinglePacked(byte[] unpacked, byte[] packed) {
     int total = 0;
     for (int i = 0; i < packed.length; i++) {
       byte packedByte = packed[i];
