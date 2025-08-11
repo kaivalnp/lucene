@@ -17,7 +17,11 @@
 
 package org.apache.lucene.util;
 
-/** Simple interface to map one float to another (useful in scaling scores). */
+/**
+ * Simple interface to map one float to another (useful in scaling scores).
+ *
+ * @lucene.internal
+ */
 @FunctionalInterface
 public interface FloatToFloatFunction {
   float apply(float f);
