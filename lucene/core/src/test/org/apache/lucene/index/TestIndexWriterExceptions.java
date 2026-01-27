@@ -663,14 +663,12 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
       writer.addDocument(doc);
       doc.add(newField("crash", "this should crash after 4 terms", DocCopyIterator.custom5));
       doc.add(newField("other", "this will not get indexed", DocCopyIterator.custom5));
-      try {
-        writer.addDocument(doc);
-        fail("did not hit expected exception");
-      } catch (IOException ioe) {
-        if (VERBOSE) {
-          System.out.println("TEST: hit expected exception");
-          ioe.printStackTrace(System.out);
-        }
+      IndexWriter finalWriter = writer;
+      Document finalDoc = doc;
+      IOException ioe = expectThrows(IOException.class, () -> finalWriter.addDocument(finalDoc));
+      if (VERBOSE) {
+        System.out.println("TEST: hit expected exception");
+        ioe.printStackTrace(System.out);
       }
 
       if (0 == i) {
@@ -960,13 +958,7 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
     for (int i = 0; i < 23; i++) {
       addDoc(writer);
       if ((i - 1) % 2 == 0) {
-        try {
-          writer.commit();
-        } catch (
-            @SuppressWarnings("unused")
-            IOException ioe) {
-          // expected
-        }
+        expectThrows(IOException.class, () -> writer.commit());
       }
     }
     ((ConcurrentMergeScheduler) writer.getConfig().getMergeScheduler()).sync();
@@ -1731,7 +1723,6 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
           Field theField = new StoredField("foo", v);
           doc.add(theField);
           iw.addDocument(doc);
-          fail("didn't get expected exception");
         });
 
     assertNull(iw.getTragicException());
@@ -1760,7 +1751,6 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
           BytesRef v = null;
           theField.setBytesValue(v);
           iw.addDocument(doc);
-          fail("didn't get expected exception");
         });
 
     assertNull(iw.getTragicException());
@@ -1789,7 +1779,6 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
           Field theField = new StoredField("foo", v);
           doc.add(theField);
           iw.addDocument(doc);
-          fail("didn't get expected exception");
         });
 
     assertNull(iw.getTragicException());
@@ -2252,16 +2241,14 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
               return true;
             }
           }) {
-        writer.rollback();
-        fail();
+        RuntimeException e = expectThrows(RuntimeException.class, () -> writer.rollback());
+        assertEquals("boom", e.getMessage());
+        assertEquals(
+            "has suppressed exceptions: " + Arrays.toString(e.getSuppressed()),
+            0,
+            e.getSuppressed().length);
+        assertNull(e.getCause());
       }
-    } catch (RuntimeException e) {
-      assertEquals("boom", e.getMessage());
-      assertEquals(
-          "has suppressed exceptions: " + Arrays.toString(e.getSuppressed()),
-          0,
-          e.getSuppressed().length);
-      assertNull(e.getCause());
     }
   }
 
@@ -2313,12 +2300,14 @@ public class TestIndexWriterExceptions extends LuceneTestCase {
         doc.add(new IntPoint("point2d", random().nextInt(), random().nextInt()));
         writer.addDocument(new Document());
       }
-      try {
-        writer.commit();
-        fail();
-      } catch (RuntimeException e) {
-        assertEquals("boom", e.getMessage());
-      }
+      RuntimeException expected =
+          expectThrows(
+              RuntimeException.class,
+              () -> {
+                writer.commit();
+              });
+      assertEquals("boom", expected.getMessage());
+
       try {
         maybeFailDelete.set(true);
         writer.rollback();

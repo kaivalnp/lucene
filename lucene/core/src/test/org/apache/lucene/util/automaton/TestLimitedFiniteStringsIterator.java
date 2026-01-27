@@ -55,7 +55,6 @@ public class TestLimitedFiniteStringsIterator extends LuceneTestCase {
         IllegalArgumentException.class,
         () -> {
           new LimitedFiniteStringsIterator(a, -7);
-          fail("did not hit exception");
         });
   }
 
