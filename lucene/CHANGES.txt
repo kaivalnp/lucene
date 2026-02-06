@@ -20,7 +20,7 @@ Improvements
 
 Optimizations
 ---------------------
-(No changes)
+* GITHUB#15637: Lazily allocate ByteArrayDataInputs in SegmentTermsEnumFrame#15637 (Misha Dmitriev)
 
 Bug Fixes
 ---------------------
