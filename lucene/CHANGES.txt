@@ -24,7 +24,8 @@ Optimizations
 
 Bug Fixes
 ---------------------
-(No changes)
+* GITHUB#15668: Fix UnsupportedOperationException in WeightedSpanTermExtractor by
+  implementing getFieldInfos in DelegatingLeafReader. (Simranjeet Singh)
 
 Other
 ---------------------
