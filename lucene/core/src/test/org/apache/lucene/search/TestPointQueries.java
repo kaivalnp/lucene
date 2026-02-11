@@ -2114,7 +2114,7 @@ public class TestPointQueries extends LuceneTestCase {
     }
 
     PointInSetQuery query =
-        (PointInSetQuery) BinaryPoint.newSetQuery("field", values.toArray(new byte[][] {}));
+        (PointInSetQuery) BinaryPoint.newSetQuery("field", values.toArray(byte[][]::new));
     Collection<byte[]> packedPoints = query.getPackedPoints();
     assertEquals(numValues, packedPoints.size());
     Iterator<byte[]> iterator = packedPoints.iterator();
