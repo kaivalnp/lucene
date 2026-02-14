@@ -30,6 +30,8 @@ Bug Fixes
 * GITHUB#15668: Fix UnsupportedOperationException in WeightedSpanTermExtractor by
   implementing getFieldInfos in DelegatingLeafReader. (Simranjeet Singh)
 
+* GITHUB#15702: Fix Potential NullPointException in BytesRefHash initialization#15702 (tyronecai)
+
 Other
 ---------------------
 * GITHUB#15586: Document that scoring and ranking may change across major Lucene versions, and that applications requiring stable ranking should explicitly configure Similarity. (Parveen Saini)
