@@ -29,6 +29,8 @@ Optimizations
 
 * GITHUB#15718 Skip per-document stored field reads on sorted indices when no stored fields are present (Francisco Fernández Castaño)
 
+* GITHUB#15729: Lucene90DocValuesProducer is not prefetching any data for DocValueSkippers anymore (Alexander Reelsen)
+
 Bug Fixes
 ---------------------
 * GITHUB#15668: Fix UnsupportedOperationException in WeightedSpanTermExtractor by
