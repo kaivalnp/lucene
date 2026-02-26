@@ -452,8 +452,6 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
     final float[] mergedCentroid = new float[fieldInfo.getVectorDimension()];
     int vectorCount = mergeAndRecalculateCentroids(mergeState, fieldInfo, mergedCentroid);
 
-    // Don't need access to the random vectors, we can just use the merged
-    rawVectorDelegate.mergeOneField(fieldInfo, mergeState);
     centroid = mergedCentroid;
     cDotC = vectorCount > 0 ? VectorUtil.dotProduct(centroid, centroid) : 0;
     if (segmentWriteState.infoStream.isEnabled(QUANTIZED_VECTOR_COMPONENT)) {
@@ -532,50 +530,10 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
           cDotC,
           docsWithField);
 
-      final IndexInput finalQuantizedDataInput = quantizedDataInput;
-      final IndexInput finalQuantizedScoreDataInput = quantizedScoreDataInput;
-      tempQuantizedVectorData = null;
-      tempScoreQuantizedVectorData = null;
-      quantizedDataInput = null;
-      quantizedScoreDataInput = null;
-
-      OffHeapScalarQuantizedVectorValues vectorValues =
-          new OffHeapScalarQuantizedVectorValues.DenseOffHeapVectorValues(
-              fieldInfo.getVectorDimension(),
-              docsWithField.cardinality(),
-              centroid,
-              cDotC,
-              quantizer,
-              encoding,
-              fieldInfo.getVectorSimilarityFunction(),
-              vectorsScorer,
-              finalQuantizedDataInput);
-      OffHeapScalarQuantizedVectorValues scoreVectorValues = null;
-      if (finalQuantizedScoreDataInput != null) {
-        scoreVectorValues =
-            new OffHeapScalarQuantizedVectorValues.DenseOffHeapVectorValues(
-                true,
-                fieldInfo.getVectorDimension(),
-                docsWithField.cardinality(),
-                centroid,
-                cDotC,
-                quantizer,
-                encoding,
-                fieldInfo.getVectorSimilarityFunction(),
-                vectorsScorer,
-                finalQuantizedScoreDataInput);
-      }
-      RandomVectorScorerSupplier scorerSupplier =
-          scoreVectorValues == null
-              ? vectorsScorer.getRandomVectorScorerSupplier(
-                  fieldInfo.getVectorSimilarityFunction(), vectorValues)
-              : vectorsScorer.getRandomVectorScorerSupplier(
-                  fieldInfo.getVectorSimilarityFunction(), scoreVectorValues, vectorValues);
       return new QuantizedCloseableRandomVectorScorerSupplier(
-          scorerSupplier,
-          vectorValues,
+          // use unquantized vectors to build index
+          rawVectorDelegate.mergeOneFieldToIndex(fieldInfo, mergeState),
           () -> {
-            IOUtils.close(finalQuantizedDataInput, finalQuantizedScoreDataInput);
             if (tempScoreQuantizedVectorName != null) {
               IOUtils.deleteFilesIgnoringExceptions(
                   segmentWriteState.directory, tempScoreQuantizedVectorName);
@@ -897,37 +855,36 @@ public class Lucene104ScalarQuantizedVectorsWriter extends FlatVectorsWriter {
     }
   }
 
-  static class QuantizedCloseableRandomVectorScorerSupplier
+  static final class QuantizedCloseableRandomVectorScorerSupplier
       implements CloseableRandomVectorScorerSupplier {
-    private final RandomVectorScorerSupplier supplier;
-    private final KnnVectorValues vectorValues;
+    private final CloseableRandomVectorScorerSupplier delegate;
     private final Closeable onClose;
 
     QuantizedCloseableRandomVectorScorerSupplier(
-        RandomVectorScorerSupplier supplier, KnnVectorValues vectorValues, Closeable onClose) {
-      this.supplier = supplier;
+        CloseableRandomVectorScorerSupplier delegate, Closeable onClose) {
+      this.delegate = delegate;
       this.onClose = onClose;
-      this.vectorValues = vectorValues;
     }
 
     @Override
     public UpdateableRandomVectorScorer scorer() throws IOException {
-      return supplier.scorer();
+      return delegate.scorer();
     }
 
     @Override
     public RandomVectorScorerSupplier copy() throws IOException {
-      return supplier.copy();
+      return delegate.copy();
     }
 
     @Override
     public void close() throws IOException {
+      delegate.close();
       onClose.close();
     }
 
     @Override
     public int totalVectorCount() {
-      return vectorValues.size();
+      return delegate.totalVectorCount();
     }
   }
 
