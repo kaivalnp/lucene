@@ -68,7 +68,10 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
   }
 
   static void checkInvariants(int maxOrd, int vectorByteLength, IndexInput input) {
-    if (input.length() < (long) vectorByteLength * maxOrd) {
+    // When ordToOffset is overridden (e.g. dedup format), the input may be smaller than
+    // maxOrd * vectorByteLength because multiple ords can map to the same offset.
+    // We only check that the input is non-empty when there are vectors.
+    if (maxOrd > 0 && input.length() < vectorByteLength) {
       throw new IllegalArgumentException("input length is less than expected vector data");
     }
   }
@@ -282,8 +285,8 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
     @Override
     public float score(int node) {
       checkOrdinal(node);
-      long queryAddr = (long) queryOrd * vectorByteSize;
-      long addr = (long) node * vectorByteSize;
+      long queryAddr = values.ordToOffset(queryOrd);
+      long addr = values.ordToOffset(node);
       var raw = vectorOp(seg, queryAddr, addr, dims);
       return normalizeRawScore(raw);
     }
@@ -291,14 +294,14 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
     @Override
     public float bulkScore(int[] nodes, float[] scores, int numNodes) {
       int i = 0;
-      long queryAddr = (long) queryOrd * vectorByteSize;
+      long queryAddr = values.ordToOffset(queryOrd);
       float maxScore = Float.NEGATIVE_INFINITY;
       final int limit = numNodes & ~3;
       for (; i < limit; i += 4) {
-        long offset1 = (long) nodes[i] * vectorByteSize;
-        long offset2 = (long) nodes[i + 1] * vectorByteSize;
-        long offset3 = (long) nodes[i + 2] * vectorByteSize;
-        long offset4 = (long) nodes[i + 3] * vectorByteSize;
+        long offset1 = values.ordToOffset(nodes[i]);
+        long offset2 = values.ordToOffset(nodes[i + 1]);
+        long offset3 = values.ordToOffset(nodes[i + 2]);
+        long offset4 = values.ordToOffset(nodes[i + 3]);
         vectorOp(seg, scratchScores, queryAddr, offset1, offset2, offset3, offset4, dims);
         scores[i + 0] = normalizeRawScore(scratchScores[0]);
         maxScore = Math.max(maxScore, scores[i + 0]);
@@ -312,9 +315,9 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
       // Handle remaining 1–3 nodes in bulk (if any)
       int remaining = numNodes - i;
       if (remaining > 0) {
-        long addr1 = (long) nodes[i] * vectorByteSize;
-        long addr2 = (remaining > 1) ? (long) nodes[i + 1] * vectorByteSize : addr1;
-        long addr3 = (remaining > 2) ? (long) nodes[i + 2] * vectorByteSize : addr1;
+        long addr1 = values.ordToOffset(nodes[i]);
+        long addr2 = (remaining > 1) ? values.ordToOffset(nodes[i + 1]) : addr1;
+        long addr3 = (remaining > 2) ? values.ordToOffset(nodes[i + 2]) : addr1;
         vectorOp(seg, scratchScores, queryAddr, addr1, addr2, addr3, addr1, dims);
         scores[i] = normalizeRawScore(scratchScores[0]);
         maxScore = Math.max(maxScore, scores[i]);

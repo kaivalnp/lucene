@@ -33,6 +33,7 @@ abstract sealed class Lucene99MemorySegmentByteVectorScorer
 
   final int vectorByteSize;
   final MemorySegmentAccessInput input;
+  final KnnVectorValues values;
   final byte[] query;
   byte[] scratch;
 
@@ -61,13 +62,14 @@ abstract sealed class Lucene99MemorySegmentByteVectorScorer
       MemorySegmentAccessInput input, KnnVectorValues values, byte[] queryVector) {
     super(values);
     this.input = input;
+    this.values = values;
     this.vectorByteSize = values.getVectorByteLength();
     this.query = queryVector;
   }
 
   final MemorySegment getSegment(int ord) throws IOException {
     checkOrdinal(ord);
-    long byteOffset = (long) ord * vectorByteSize;
+    long byteOffset = values.ordToOffset(ord);
     MemorySegment seg = input.segmentSliceOrNull(byteOffset, vectorByteSize);
     if (seg == null) {
       if (scratch == null) {

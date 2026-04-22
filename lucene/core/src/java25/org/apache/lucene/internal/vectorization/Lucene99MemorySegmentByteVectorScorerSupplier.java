@@ -67,7 +67,7 @@ public abstract sealed class Lucene99MemorySegmentByteVectorScorerSupplier
   }
 
   static void checkInvariants(int maxOrd, int vectorByteLength, IndexInput input) {
-    if (input.length() < (long) vectorByteLength * maxOrd) {
+    if (maxOrd > 0 && input.length() < vectorByteLength) {
       throw new IllegalArgumentException("input length is less than expected vector data");
     }
   }
@@ -79,7 +79,7 @@ public abstract sealed class Lucene99MemorySegmentByteVectorScorerSupplier
   }
 
   final MemorySegment getFirstSegment(int ord) throws IOException {
-    long byteOffset = (long) ord * vectorByteSize;
+    long byteOffset = values.ordToOffset(ord);
     MemorySegment seg = input.segmentSliceOrNull(byteOffset, vectorByteSize);
     if (seg == null) {
       if (scratch1 == null) {
@@ -92,7 +92,7 @@ public abstract sealed class Lucene99MemorySegmentByteVectorScorerSupplier
   }
 
   final MemorySegment getSecondSegment(int ord) throws IOException {
-    long byteOffset = (long) ord * vectorByteSize;
+    long byteOffset = values.ordToOffset(ord);
     MemorySegment seg = input.segmentSliceOrNull(byteOffset, vectorByteSize);
     if (seg == null) {
       if (scratch2 == null) {
