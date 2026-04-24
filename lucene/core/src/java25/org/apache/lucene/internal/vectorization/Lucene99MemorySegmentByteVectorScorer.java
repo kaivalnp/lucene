@@ -19,6 +19,7 @@ package org.apache.lucene.internal.vectorization;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.util.Optional;
+import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
@@ -34,6 +35,7 @@ abstract sealed class Lucene99MemorySegmentByteVectorScorer
   final int vectorByteSize;
   final MemorySegmentAccessInput input;
   final KnnVectorValues values;
+  final HasIndexSlice indexSlice;
   final byte[] query;
   byte[] scratch;
 
@@ -63,13 +65,14 @@ abstract sealed class Lucene99MemorySegmentByteVectorScorer
     super(values);
     this.input = input;
     this.values = values;
+    this.indexSlice = (HasIndexSlice) values;
     this.vectorByteSize = values.getVectorByteLength();
     this.query = queryVector;
   }
 
   final MemorySegment getSegment(int ord) throws IOException {
     checkOrdinal(ord);
-    long byteOffset = values.ordToOffset(ord);
+    long byteOffset = indexSlice.ordToOffset(ord, vectorByteSize);
     MemorySegment seg = input.segmentSliceOrNull(byteOffset, vectorByteSize);
     if (seg == null) {
       if (scratch == null) {

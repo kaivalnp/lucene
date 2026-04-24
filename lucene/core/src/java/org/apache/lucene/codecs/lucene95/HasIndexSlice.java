@@ -20,10 +20,26 @@ import org.apache.lucene.store.IndexInput;
 
 /**
  * Implementors can return the IndexInput from which their values are read. For use by vector
- * quantizers.
+ * quantizers and off-heap vector scorers.
  */
 public interface HasIndexSlice {
 
   /** Returns an IndexInput from which to read this instance's values, or null if not available. */
   IndexInput getSlice();
+
+  /**
+   * Returns the byte offset within the backing {@link #getSlice() slice} for the vector at the
+   * given ordinal. The default implementation assumes vectors are stored contiguously: {@code ord *
+   * vectorByteSize}.
+   *
+   * <p>Formats that use indirection (e.g., de-duplicating formats with an ordinal mapping) override
+   * this to return the correct offset.
+   *
+   * @param ord the vector ordinal
+   * @param vectorByteSize the byte size of each vector
+   * @return the byte offset for the vector
+   */
+  default long ordToOffset(int ord, int vectorByteSize) {
+    return (long) ord * vectorByteSize;
+  }
 }

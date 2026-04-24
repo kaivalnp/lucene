@@ -44,6 +44,10 @@ import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Sorter;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.internal.hppc.LongIntHashMap;
+import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.FileDataHint;
+import org.apache.lucene.store.FileTypeHint;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.ArrayUtil;
@@ -54,12 +58,14 @@ import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 import org.apache.lucene.util.hnsw.UpdateableRandomVectorScorer;
 
 /**
- * Writer that de-duplicates vectors across all fields in a segment.
+ * Writer that de-duplicates vectors across all fields in a segment. Unique vectors are stored in a
+ * contiguous dictionary region in the .dvd file. Each field stores a compact ordinal mapping from
+ * document ords to dictionary ords.
  *
- * <p>.dvd layout: [header][dict vectors][per-field ordToDict vints][per-field OrdToDoc
- * DISI][footer]
- *
- * <p>At merge time, only a {@code long→int} hash map is in memory (~12 bytes/unique vector).
+ * <p>Merge uses a two-pass approach per field. Pass 1 writes all vectors (including duplicates) to
+ * a temp file. Pass 2 reads back from the closed temp file, hashes, deduplicates against the
+ * dictionary, and builds the ordToDict mapping. Only the hash map (~16 bytes/unique vector) and the
+ * ordinal mapping (4 bytes/doc) are held in memory.
  *
  * @lucene.experimental
  */
@@ -68,26 +74,41 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
   private static final int DIRECT_MONOTONIC_BLOCK_SHIFT = 16;
 
   private final SegmentWriteState segmentWriteState;
-  private final IndexOutput meta, data;
-  private final IndexOutput tempMappings;
-
-  /** Temp file for dictionary vectors — supports read-back for collision verification. */
-  private IndexOutput dictTempOut;
+  private final IndexOutput meta;
+  private final IndexOutput data;
 
   private final List<FieldWriter<?>> fields = new ArrayList<>();
-
-  /** Deferred per-field metadata, written to meta/data in finish(). */
   private final List<PendingField> pendingFields = new ArrayList<>();
 
-  /** Per-field dictionary: 64-bit hash → dictOrd. Reset per field. */
+  // --- Dictionary state (shared across fields with matching dim/encoding) ---
+
+  /** Hash map for dedup: 64-bit vector hash → dictOrd. */
   private final LongIntHashMap hashToOrd = new LongIntHashMap();
 
-  private int dictSize; // unique vectors in current field's dictionary
-  private long dictDataOffset; // start of current field's dictionary in .dvd
-  private int dictDimension; // dimension of current field
-  private VectorEncoding dictEncoding; // encoding of current field
-  private int vectorByteSize; // bytes per vector in current field
-  private ByteBuffer writeBuf; // reused for writing float vectors
+  /**
+   * Dictionary vectors are written to a temp file, then bulk-copied to {@code data} at finish time.
+   * During flush, this file is also read back for collision verification (with mode toggling).
+   * During merge, collision verification reads from the per-field temp file instead.
+   */
+  private IndexOutput dictTempOut;
+
+  private String dictTempName;
+
+  /** Read handle for collision verification. Opened lazily, closed on next write. */
+  private IndexInput dictReadHandle;
+
+  private int dictSize;
+  private long dictDataOffset;
+  private int dictDimension;
+  private VectorEncoding dictEncoding;
+  private int vectorByteSize;
+
+  /** Reusable byte buffer for serializing float vectors. Used for both hashing and writing. */
+  private byte[] vectorBytes;
+
+  /** Reusable byte buffer for bulk collision verification reads. */
+  private byte[] compareBytes;
+
   private boolean finished;
 
   DedupFlatVectorsWriter(SegmentWriteState state, FlatVectorsScorer scorer) throws IOException {
@@ -104,7 +125,6 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
     try {
       meta = state.directory.createOutput(metaFileName, state.context);
       data = state.directory.createOutput(dataFileName, state.context);
-      tempMappings = state.directory.createTempOutput(dataFileName, "dedup-maps", state.context);
 
       CodecUtil.writeIndexHeader(
           meta,
@@ -118,8 +138,6 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
           DedupFlatVectorsFormat.VERSION_CURRENT,
           state.segmentInfo.getId(),
           state.segmentSuffix);
-
-      dictDataOffset = data.getFilePointer();
     } catch (Throwable t) {
       IOUtils.closeWhileSuppressingExceptions(t, this);
       throw t;
@@ -133,7 +151,7 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
     return newField;
   }
 
-  // --- Flush ---
+  // ---- Flush path ----
 
   @Override
   public void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
@@ -157,8 +175,7 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
               0,
               maxDoc,
               docsWithField,
-              0,
-              0,
+              null,
               0,
               0,
               field.fieldInfo.getVectorDimension(),
@@ -168,6 +185,7 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
 
     initDict(field.fieldInfo);
 
+    // Apply sort map if needed
     int[] ordMap = null;
     if (sortMap != null) {
       ordMap = new int[size];
@@ -176,12 +194,12 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
       docsWithField = newDocsWithField;
     }
 
-    long mapOffset = tempMappings.getFilePointer();
+    // Dedup and build mapping in memory (flush buffers are bounded by indexing buffer size)
+    int[] ordToDict = new int[size];
     for (int newOrd = 0; newOrd < size; newOrd++) {
       int srcOrd = ordMap != null ? ordMap[newOrd] : newOrd;
-      tempMappings.writeVInt(addToDict(vectors.get(srcOrd)));
+      ordToDict[newOrd] = addToDict(vectors.get(srcOrd));
     }
-    long mapLength = tempMappings.getFilePointer() - mapOffset;
 
     pendingFields.add(
         new PendingField(
@@ -189,127 +207,150 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
             size,
             maxDoc,
             docsWithField,
-            mapOffset,
-            mapLength,
+            ordToDict,
             dictSize,
             dictDataOffset,
             dictDimension,
             dictEncoding));
   }
 
-  // --- Merge (streaming) ---
+  // ---- Merge path (two-pass) ----
+
+  /**
+   * Pass 1: iterate merged vector values and write all vectors (including duplicates) to a temp
+   * file. Returns the number of vectors written and populates {@code docsWithField}.
+   */
+  private int writeMergedVectorsToTemp(
+      FieldInfo fieldInfo,
+      MergeState mergeState,
+      IndexOutput tempOut,
+      DocsWithFieldSet docsWithField)
+      throws IOException {
+    VectorEncoding encoding = fieldInfo.getVectorEncoding();
+    int byteSize = fieldInfo.getVectorDimension() * encoding.byteSize;
+    KnnVectorValues merged =
+        switch (encoding) {
+          case FLOAT32 ->
+              KnnVectorsWriter.MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
+          case BYTE ->
+              KnnVectorsWriter.MergedVectorValues.mergeByteVectorValues(fieldInfo, mergeState);
+        };
+
+    int count = 0;
+    KnnVectorValues.DocIndexIterator iter = merged.iterator();
+    for (int doc = iter.nextDoc(); doc != NO_MORE_DOCS; doc = iter.nextDoc()) {
+      byte[] rawBytes = vectorToBytes(merged, iter.index());
+      tempOut.writeBytes(rawBytes, 0, byteSize);
+      docsWithField.add(doc);
+      count++;
+    }
+    return count;
+  }
 
   @Override
   public void mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
     initDict(fieldInfo);
     int maxDoc = segmentWriteState.segmentInfo.maxDoc();
-    KnnVectorValues merged =
-        switch (fieldInfo.getVectorEncoding()) {
-          case FLOAT32 ->
-              KnnVectorsWriter.MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
-          case BYTE ->
-              KnnVectorsWriter.MergedVectorValues.mergeByteVectorValues(fieldInfo, mergeState);
-        };
-    streamMerge(fieldInfo, merged, maxDoc);
-  }
+    int byteSize = fieldInfo.getVectorDimension() * fieldInfo.getVectorEncoding().byteSize;
 
-  /**
-   * Stream vectors one at a time: hash-dedup to dict, write mapping to temp. O(1) vector memory.
-   */
-  private void streamMerge(FieldInfo fieldInfo, KnnVectorValues values, int maxDoc)
-      throws IOException {
-    DocsWithFieldSet docsWithField = new DocsWithFieldSet();
-    long mapOffset = tempMappings.getFilePointer();
+    // Pass 1: write all vectors to a temp file.
+    IndexOutput tempOut =
+        segmentWriteState.directory.createTempOutput(
+            data.getName(), "dedup-merge", segmentWriteState.context);
+    String tempName = tempOut.getName();
+    try {
+      DocsWithFieldSet docsWithField = new DocsWithFieldSet();
+      int count = writeMergedVectorsToTemp(fieldInfo, mergeState, tempOut, docsWithField);
+      CodecUtil.writeFooter(tempOut);
+      IOUtils.close(tempOut);
 
-    KnnVectorValues.DocIndexIterator iter = values.iterator();
-    for (int doc = iter.nextDoc(); doc != NO_MORE_DOCS; doc = iter.nextDoc()) {
-      Object vec =
-          values instanceof FloatVectorValues fv
-              ? fv.vectorValue(iter.index())
-              : ((ByteVectorValues) values).vectorValue(iter.index());
-      tempMappings.writeVInt(addToDict(vec));
-      docsWithField.add(doc);
+      if (count == 0) {
+        pendingFields.add(
+            new PendingField(
+                fieldInfo,
+                0,
+                maxDoc,
+                docsWithField,
+                null,
+                dictSize,
+                dictDataOffset,
+                dictDimension,
+                dictEncoding));
+        return;
+      }
+
+      // Pass 2: dedup from the closed temp file.
+      try (IndexInput tempIn =
+          segmentWriteState.directory.openInput(tempName, segmentWriteState.context)) {
+        dedupFromTempFile(fieldInfo, tempIn, count, maxDoc, docsWithField, byteSize);
+      }
+    } finally {
+      IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, tempName);
     }
-    long mapLength = tempMappings.getFilePointer() - mapOffset;
-
-    pendingFields.add(
-        new PendingField(
-            fieldInfo,
-            docsWithField.cardinality(),
-            maxDoc,
-            docsWithField,
-            mapOffset,
-            mapLength,
-            dictSize,
-            dictDataOffset,
-            dictDimension,
-            dictEncoding));
   }
 
   @Override
   public CloseableRandomVectorScorerSupplier mergeOneFieldToIndex(
       FieldInfo fieldInfo, MergeState mergeState) throws IOException {
-    mergeOneField(fieldInfo, mergeState);
-    // Re-stream to build scorer for HNSW (same pattern as Lucene99FlatVectorsWriter)
-    KnnVectorValues merged =
-        switch (fieldInfo.getVectorEncoding()) {
-          case FLOAT32 ->
-              KnnVectorsWriter.MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
-          case BYTE ->
-              KnnVectorsWriter.MergedVectorValues.mergeByteVectorValues(fieldInfo, mergeState);
-        };
-    return buildTempFileScorer(fieldInfo, merged);
-  }
-
-  private CloseableRandomVectorScorerSupplier buildTempFileScorer(
-      FieldInfo fieldInfo, KnnVectorValues values) throws IOException {
-    int dim = fieldInfo.getVectorDimension();
+    initDict(fieldInfo);
+    int maxDoc = segmentWriteState.segmentInfo.maxDoc();
     VectorEncoding encoding = fieldInfo.getVectorEncoding();
-    int byteSize = dim * encoding.byteSize;
+    int byteSize = fieldInfo.getVectorDimension() * encoding.byteSize;
 
-    // Write vectors to temp file
-    IndexOutput tempOut =
+    // Pass 1: write all vectors to a temp file (also used as the HNSW scorer source).
+    IndexOutput scorerTempOut =
         segmentWriteState.directory.createTempOutput(
             data.getName(), "dedup-scorer", segmentWriteState.context);
-    int count = 0;
-    IndexInput tempIn = null;
+    IndexInput scorerTempIn = null;
     try {
-      ByteBuffer buf =
-          encoding == VectorEncoding.FLOAT32
-              ? ByteBuffer.allocate(byteSize).order(ByteOrder.LITTLE_ENDIAN)
-              : null;
-      KnnVectorValues.DocIndexIterator iter = values.iterator();
-      for (int doc = iter.nextDoc(); doc != NO_MORE_DOCS; doc = iter.nextDoc()) {
-        if (values instanceof FloatVectorValues fv) {
-          buf.clear();
-          buf.asFloatBuffer().put(fv.vectorValue(iter.index()));
-          tempOut.writeBytes(buf.array(), byteSize);
-        } else {
-          byte[] v = ((ByteVectorValues) values).vectorValue(iter.index());
-          tempOut.writeBytes(v, v.length);
+      DocsWithFieldSet docsWithField = new DocsWithFieldSet();
+      int count = writeMergedVectorsToTemp(fieldInfo, mergeState, scorerTempOut, docsWithField);
+      CodecUtil.writeFooter(scorerTempOut);
+      IOUtils.close(scorerTempOut);
+
+      // Pass 2: dedup from the closed temp file.
+      if (count > 0) {
+        try (IndexInput tempIn =
+            segmentWriteState.directory.openInput(
+                scorerTempOut.getName(), segmentWriteState.context)) {
+          dedupFromTempFile(fieldInfo, tempIn, count, maxDoc, docsWithField, byteSize);
         }
-        count++;
+      } else {
+        pendingFields.add(
+            new PendingField(
+                fieldInfo,
+                0,
+                maxDoc,
+                docsWithField,
+                null,
+                dictSize,
+                dictDataOffset,
+                dictDimension,
+                dictEncoding));
       }
-      CodecUtil.writeFooter(tempOut);
-      IOUtils.close(tempOut);
 
-      tempIn = segmentWriteState.directory.openInput(tempOut.getName(), segmentWriteState.context);
+      // Reopen with random-access hints for HNSW scorer construction.
+      scorerTempIn =
+          segmentWriteState.directory.openInput(
+              scorerTempOut.getName(),
+              IOContext.DEFAULT.withHints(
+                  FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM));
 
-      KnnVectorValues vectorValues =
+      KnnVectorValues scorerValues =
           switch (encoding) {
             case FLOAT32 ->
                 new OffHeapFloatVectorValues.DenseOffHeapVectorValues(
-                    dim,
+                    fieldInfo.getVectorDimension(),
                     count,
-                    tempIn,
+                    scorerTempIn,
                     byteSize,
                     vectorsScorer,
                     fieldInfo.getVectorSimilarityFunction());
             case BYTE ->
                 new OffHeapByteVectorValues.DenseOffHeapVectorValues(
-                    dim,
+                    fieldInfo.getVectorDimension(),
                     count,
-                    tempIn,
+                    scorerTempIn,
                     byteSize,
                     vectorsScorer,
                     fieldInfo.getVectorSimilarityFunction());
@@ -317,12 +358,12 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
 
       RandomVectorScorerSupplier supplier =
           vectorsScorer.getRandomVectorScorerSupplier(
-              fieldInfo.getVectorSimilarityFunction(), vectorValues);
+              fieldInfo.getVectorSimilarityFunction(), scorerValues);
 
       final int finalCount = count;
-      final IndexInput finalTempIn = tempIn;
-      final String tempFileName = tempOut.getName();
-      tempIn = null; // ownership transferred to the supplier
+      final IndexInput finalTempIn = scorerTempIn;
+      final String tempFileName = scorerTempOut.getName();
+      scorerTempIn = null; // ownership transferred
       return new CloseableRandomVectorScorerSupplier() {
         @Override
         public UpdateableRandomVectorScorer scorer() throws IOException {
@@ -346,13 +387,117 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
         }
       };
     } catch (Throwable t) {
-      IOUtils.closeWhileSuppressingExceptions(t, tempIn, tempOut);
-      IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, tempOut.getName());
+      IOUtils.closeWhileSuppressingExceptions(t, scorerTempIn, scorerTempOut);
+      IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, scorerTempOut.getName());
       throw t;
     }
   }
 
-  // --- Dictionary ---
+  /**
+   * Pass 2 of the two-pass merge. Reads vectors from a closed temp file, hashes and deduplicates
+   * them against the dictionary, and builds the ordToDict mapping.
+   *
+   * <p>Phase A (dict in read mode): scans all vectors, resolves each to a dictOrd via hash lookup
+   * and byte-for-byte verification. New unique vectors are assigned dictOrds but not yet written.
+   *
+   * <p>Phase B (dict in write mode): seeks to each new unique vector in the temp file and appends
+   * it to the dictionary. Only new vectors are read — duplicates are skipped.
+   *
+   * <p>The dict temp file is toggled once per field (read for phase A, write for phase B), not per
+   * vector.
+   */
+  private void dedupFromTempFile(
+      FieldInfo fieldInfo,
+      IndexInput tempIn,
+      int count,
+      int maxDoc,
+      DocsWithFieldSet docsWithField,
+      int byteSize)
+      throws IOException {
+    int[] ordToDict = new int[count];
+    int dictSizeBefore = dictSize;
+
+    // Phase A: dict in read mode — hash, dedup, build ordToDict.
+    IndexInput dictIn = getDictReadHandle();
+    // Temp-file indices of new unique vectors (for phase B writes). Sized to count as upper bound.
+    int numNew = 0;
+    int[] newVectorTempIndices = new int[count];
+
+    for (int i = 0; i < count; i++) {
+      tempIn.seek((long) i * byteSize);
+      tempIn.readBytes(vectorBytes, 0, byteSize);
+      long hash = hashBytes(vectorBytes, byteSize);
+
+      int dictOrd = -1;
+      for (int probe = 0; ; probe++) {
+        long probeHash = hash + probe;
+        int existing = hashToOrd.getOrDefault(probeHash, -1);
+        if (existing < 0) {
+          // New unique vector
+          dictOrd = dictSize++;
+          hashToOrd.put(probeHash, dictOrd);
+          newVectorTempIndices[numNew++] = i;
+          break;
+        }
+        // Hash hit — verify byte-for-byte equality
+        IndexInput verifySource;
+        if (existing >= dictSizeBefore) {
+          // Candidate was added by this field — read from temp file
+          tempIn.seek((long) newVectorTempIndices[existing - dictSizeBefore] * byteSize);
+          verifySource = tempIn;
+        } else {
+          // Candidate from a previous field — read from dict temp file
+          dictIn.seek((long) existing * byteSize);
+          verifySource = dictIn;
+        }
+        verifySource.readBytes(compareBytes, 0, byteSize);
+        if (Arrays.equals(vectorBytes, 0, byteSize, compareBytes, 0, byteSize)) {
+          dictOrd = existing;
+          break;
+        }
+        // Hash collision — continue probing
+      }
+      ordToDict[i] = dictOrd;
+    }
+
+    // Phase B: dict in write mode — append new unique vectors.
+    ensureDictWritable();
+    for (int n = 0; n < numNew; n++) {
+      tempIn.seek((long) newVectorTempIndices[n] * byteSize);
+      tempIn.readBytes(vectorBytes, 0, byteSize);
+      dictTempOut.writeBytes(vectorBytes, 0, byteSize);
+    }
+
+    pendingFields.add(
+        new PendingField(
+            fieldInfo,
+            count,
+            maxDoc,
+            docsWithField,
+            ordToDict,
+            dictSize,
+            dictDataOffset,
+            dictDimension,
+            dictEncoding));
+  }
+
+  /**
+   * Serialize a vector to its raw byte representation. Reuses the {@link #vectorBytes} buffer. The
+   * returned array is {@link #vectorBytes} — callers must consume it before the next call.
+   */
+  private byte[] vectorToBytes(KnnVectorValues values, int index) throws IOException {
+    if (values instanceof FloatVectorValues fv) {
+      float[] vec = fv.vectorValue(index);
+      ByteBuffer buf = ByteBuffer.wrap(vectorBytes).order(ByteOrder.LITTLE_ENDIAN);
+      buf.asFloatBuffer().put(vec);
+    } else {
+      byte[] vec = ((ByteVectorValues) values).vectorValue(index);
+      System.arraycopy(vec, 0, vectorBytes, 0, vectorByteSize);
+    }
+    return vectorBytes;
+  }
+
+  // ---- Dictionary management ----
 
   private void initDict(FieldInfo fieldInfo) throws IOException {
     int dim = fieldInfo.getVectorDimension();
@@ -360,7 +505,6 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
 
     // Reuse existing dictionary for cross-field dedup when dim/encoding match
     if (dictTempName != null && dim == dictDimension && enc == dictEncoding) {
-      // Ensure the dict temp is writable (may have been closed for collision read-back)
       ensureDictWritable();
       return;
     }
@@ -377,113 +521,91 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
     dictDimension = dim;
     dictEncoding = enc;
     vectorByteSize = dim * enc.byteSize;
-    if (enc == VectorEncoding.FLOAT32) {
-      writeBuf = ByteBuffer.allocate(vectorByteSize).order(ByteOrder.LITTLE_ENDIAN);
-    }
+    vectorBytes = new byte[vectorByteSize];
+    compareBytes = new byte[vectorByteSize];
     dictTempOut =
         segmentWriteState.directory.createTempOutput(
             data.getName(), "dedup-dict", segmentWriteState.context);
     dictTempName = dictTempOut.getName();
   }
 
-  /** Copy dictionary vectors from temp file to the main data file. */
-  private void copyDictTempToData() throws IOException {
-    if (dictTempName == null) return;
-    // Close whichever handle is open
-    if (dictReadHandle != null) {
-      // Reader was open (from collision check) — writer already has footer
-      IOUtils.close(dictReadHandle);
-      dictReadHandle = null;
-    } else if (dictTempOut != null) {
-      // Writer is still open — close it with footer
-      CodecUtil.writeFooter(dictTempOut);
-      IOUtils.close(dictTempOut);
+  /**
+   * Add a vector (already in its in-memory representation) to the dictionary. Used by the flush
+   * path where vectors are in typed arrays.
+   */
+  private <T> int addToDict(T vec) throws IOException {
+    // Serialize to raw bytes for hashing and writing
+    if (vec instanceof float[] f) {
+      ByteBuffer buf = ByteBuffer.wrap(vectorBytes).order(ByteOrder.LITTLE_ENDIAN);
+      buf.asFloatBuffer().put(f);
+    } else if (vec instanceof byte[] b) {
+      System.arraycopy(b, 0, vectorBytes, 0, vectorByteSize);
     }
-    // dictTempOut may have been closed by getDictReadHandle without nulling
-    dictTempOut = null;
-    try (IndexInput in =
-        segmentWriteState.directory.openInput(dictTempName, segmentWriteState.context)) {
-      data.copyBytes(in, in.length() - CodecUtil.footerLength());
-    }
-    IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, dictTempName);
-    dictTempName = null;
+    return addToDictFromBytes(vectorBytes);
   }
 
   /**
-   * Add vector to dictionary. On hash hit, reads back from the dictionary file to verify equality.
-   * On collision (same hash, different vector), linear-probes the hash space. Returns dictOrd.
+   * Add a vector (as raw bytes) to the dictionary. Used by the flush path only. Collision
+   * verification reads from the dict temp file, which requires toggling between read and write
+   * modes. This is acceptable during flush since the number of vectors is bounded by the indexing
+   * buffer size.
    */
-  private <T> int addToDict(T vec) throws IOException {
-    long hash = vectorHash(vec);
-    // Linear probe: on collision, try hash+1, hash+2, etc.
+  private int addToDictFromBytes(byte[] rawBytes) throws IOException {
+    long hash = hashBytes(rawBytes, vectorByteSize);
+
     for (int probe = 0; ; probe++) {
       long probeHash = hash + probe;
       int existing = hashToOrd.getOrDefault(probeHash, -1);
       if (existing < 0) {
-        // New entry — write vector to dictionary
         ensureDictWritable();
         int dictOrd = dictSize++;
         hashToOrd.put(probeHash, dictOrd);
-        writeVectorToDict(vec);
+        dictTempOut.writeBytes(rawBytes, 0, vectorByteSize);
         return dictOrd;
       }
-      // Hash hit — verify equality by reading back from dictionary file
-      if (vectorMatchesDict(vec, existing)) {
+      // Hash hit — verify equality by reading from dict temp file
+      IndexInput reader = getDictReadHandle();
+      reader.seek((long) existing * vectorByteSize);
+      reader.readBytes(compareBytes, 0, vectorByteSize);
+      if (Arrays.equals(rawBytes, 0, vectorByteSize, compareBytes, 0, vectorByteSize)) {
         return existing;
       }
-      // Hash collision with different vector — continue probing
+      // Collision — continue probing
     }
   }
 
-  /** Read vector at dictOrd from the dictionary temp file and compare to vec. */
-  private <T> boolean vectorMatchesDict(T vec, int dictOrd) throws IOException {
-    // dictOrd is relative to the current field's dictionary in the temp file
-    long offset = (long) dictOrd * vectorByteSize;
-    IndexInput readHandle = getDictReadHandle();
-    if (vec instanceof float[] f) {
-      byte[] stored = new byte[vectorByteSize];
-      readHandle.seek(offset);
-      readHandle.readBytes(stored, 0, vectorByteSize);
-      ByteBuffer storedBuf = ByteBuffer.wrap(stored).order(ByteOrder.LITTLE_ENDIAN);
-      for (int i = 0; i < f.length; i++) {
-        if (Float.floatToRawIntBits(f[i]) != Float.floatToRawIntBits(storedBuf.getFloat())) {
-          return false;
-        }
+  /**
+   * Single-pass 64-bit hash over raw bytes. Combines two independent 32-bit hashes (polynomial and
+   * FNV-1a) computed in one loop, avoiding the need to iterate the data twice.
+   */
+  static long hashBytes(byte[] bytes, int length) {
+    // Polynomial hash (same algorithm as Arrays.hashCode but on raw bytes in 4-byte groups)
+    int h1 = 1;
+    // FNV-1a hash
+    int h2 = 0x811c9dc5;
+
+    for (int i = 0; i < length; i++) {
+      int b = bytes[i] & 0xFF;
+      // FNV-1a step
+      h2 = (h2 ^ b) * 0x01000193;
+      // Accumulate into polynomial hash in 4-byte groups (matching Float.floatToIntBits layout)
+      if ((i & 3) == 0) {
+        h1 = 31 * h1;
       }
-      return true;
-    } else if (vec instanceof byte[] b) {
-      byte[] stored = new byte[vectorByteSize];
-      readHandle.seek(offset);
-      readHandle.readBytes(stored, 0, vectorByteSize);
-      return Arrays.equals(b, 0, b.length, stored, 0, stored.length);
+      h1 += b << ((i & 3) * 8);
     }
-    return false;
+
+    return ((long) h1 << 32) | (h2 & 0xFFFFFFFFL);
   }
 
-  /** Lazily opened read handle for the dictionary temp file (for collision verification). */
-  private IndexInput dictReadHandle;
+  // ---- Dictionary temp file management ----
 
-  private String dictTempName; // name of the current dict temp file
-
-  private IndexInput getDictReadHandle() throws IOException {
-    if (dictReadHandle == null) {
-      // Close the write handle so we can open for reading (MockDirectoryWrapper requirement)
-      // We'll reopen for writing after the comparison
-      CodecUtil.writeFooter(dictTempOut);
-      IOUtils.close(dictTempOut);
-      dictTempOut = null; // mark as closed
-      dictReadHandle =
-          segmentWriteState.directory.openInput(dictTempName, segmentWriteState.context);
-    }
-    return dictReadHandle;
-  }
-
-  /** After collision verification, reopen the dict temp for writing if it was closed. */
+  /** Ensure the dictionary temp file is open for writing. */
   private void ensureDictWritable() throws IOException {
     if (dictReadHandle != null) {
       IOUtils.close(dictReadHandle);
       dictReadHandle = null;
-      // Reopen: copy existing content to a new temp, then continue writing
+      // Copy existing content to a new temp file to resume writing
       String oldName = dictTempName;
       dictTempOut =
           segmentWriteState.directory.createTempOutput(
@@ -497,51 +619,38 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
     }
   }
 
-  private <T> void writeVectorToDict(T vec) throws IOException {
-    if (vec instanceof float[] f) {
-      writeBuf.clear();
-      writeBuf.asFloatBuffer().put(f);
-      dictTempOut.writeBytes(writeBuf.array(), vectorByteSize);
-    } else if (vec instanceof byte[] b) {
-      dictTempOut.writeBytes(b, b.length);
+  /** Open the dictionary temp file for reading (closes the writer first). */
+  private IndexInput getDictReadHandle() throws IOException {
+    if (dictReadHandle == null) {
+      CodecUtil.writeFooter(dictTempOut);
+      IOUtils.close(dictTempOut);
+      dictTempOut = null;
+      dictReadHandle =
+          segmentWriteState.directory.openInput(dictTempName, segmentWriteState.context);
     }
+    return dictReadHandle;
   }
 
-  /**
-   * 64-bit hash combining {@link Arrays#hashCode} (upper 32 bits) with FNV-1a (lower 32 bits).
-   * Collisions are still handled correctly by {@link #vectorMatchesDict}, but a stronger hash
-   * reduces the frequency of expensive read-back verification during merge.
-   */
-  static long vectorHash(Object vec) {
-    if (vec instanceof float[] f) {
-      return ((long) Arrays.hashCode(f) << 32) | (fnvHashFloat(f) & 0xFFFFFFFFL);
-    } else if (vec instanceof byte[] b) {
-      return ((long) Arrays.hashCode(b) << 32) | (fnvHashByte(b) & 0xFFFFFFFFL);
+  /** Copy dictionary vectors from temp file to the main data file. */
+  private void copyDictTempToData() throws IOException {
+    if (dictTempName == null) return;
+    if (dictReadHandle != null) {
+      IOUtils.close(dictReadHandle);
+      dictReadHandle = null;
+    } else if (dictTempOut != null) {
+      CodecUtil.writeFooter(dictTempOut);
+      IOUtils.close(dictTempOut);
+      dictTempOut = null;
     }
-    throw new IllegalArgumentException("Unsupported vector type");
+    try (IndexInput in =
+        segmentWriteState.directory.openInput(dictTempName, segmentWriteState.context)) {
+      data.copyBytes(in, in.length() - CodecUtil.footerLength());
+    }
+    IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, dictTempName);
+    dictTempName = null;
   }
 
-  private static int fnvHashFloat(float[] f) {
-    int h = 0x811c9dc5;
-    for (float v : f) {
-      int bits = Float.floatToRawIntBits(v);
-      h = (h ^ (bits & 0xFF)) * 0x01000193;
-      h = (h ^ ((bits >>> 8) & 0xFF)) * 0x01000193;
-      h = (h ^ ((bits >>> 16) & 0xFF)) * 0x01000193;
-      h = (h ^ ((bits >>> 24) & 0xFF)) * 0x01000193;
-    }
-    return h;
-  }
-
-  private static int fnvHashByte(byte[] b) {
-    int h = 0x811c9dc5;
-    for (byte v : b) {
-      h = (h ^ (v & 0xFF)) * 0x01000193;
-    }
-    return h;
-  }
-
-  // --- finish / close ---
+  // ---- Finish / close ----
 
   @Override
   public void finish() throws IOException {
@@ -555,18 +664,23 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
     IOUtils.close(dictReadHandle);
     dictReadHandle = null;
 
-    // Dictionary is complete in `data`. Now append mappings from temp file.
-    CodecUtil.writeFooter(tempMappings);
-    IOUtils.close(tempMappings);
-
-    long mappingsStartInData = data.getFilePointer();
-    try (IndexInput mappingsIn =
-        segmentWriteState.directory.openInput(tempMappings.getName(), segmentWriteState.context)) {
-      data.copyBytes(mappingsIn, mappingsIn.length() - CodecUtil.footerLength());
+    // Write per-field ordToDict mappings to data
+    long[] mapOffsets = new long[pendingFields.size()];
+    long[] mapLengths = new long[pendingFields.size()];
+    for (int i = 0; i < pendingFields.size(); i++) {
+      PendingField pf = pendingFields.get(i);
+      mapOffsets[i] = data.getFilePointer();
+      if (pf.ordToDict != null) {
+        for (int ord = 0; ord < pf.size; ord++) {
+          data.writeVInt(pf.ordToDict[ord]);
+        }
+      }
+      mapLengths[i] = data.getFilePointer() - mapOffsets[i];
     }
 
-    // Write per-field metadata (including per-field dict info) to meta, OrdToDoc DISI to data
-    for (PendingField pf : pendingFields) {
+    // Write per-field metadata to meta, OrdToDoc DISI data to data
+    for (int i = 0; i < pendingFields.size(); i++) {
+      PendingField pf = pendingFields.get(i);
       meta.writeInt(pf.fieldInfo.number);
       meta.writeVInt(pf.size);
       meta.writeInt(pf.fieldInfo.getVectorSimilarityFunction().ordinal());
@@ -574,53 +688,59 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
       meta.writeVInt(pf.dictDimension);
       meta.writeVInt(pf.dictEncoding != null ? pf.dictEncoding.ordinal() : -1);
       meta.writeVLong(pf.dictDataOffset);
-      meta.writeVLong(mappingsStartInData + pf.mapOffsetInTemp);
-      meta.writeVLong(pf.mapLength);
+      meta.writeVLong(mapOffsets[i]);
+      meta.writeVLong(mapLengths[i]);
       OrdToDocDISIReaderConfiguration.writeStoredMeta(
           DIRECT_MONOTONIC_BLOCK_SHIFT, meta, data, pf.size, pf.maxDoc, pf.docsWithField);
     }
 
     meta.writeInt(-1); // end-of-fields sentinel
-
     CodecUtil.writeFooter(meta);
     CodecUtil.writeFooter(data);
-
-    IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, tempMappings.getName());
   }
 
   @Override
   public long ramBytesUsed() {
     long total = RamUsageEstimator.shallowSizeOfInstance(DedupFlatVectorsWriter.class);
-    for (FieldWriter<?> field : fields) total += field.ramBytesUsed();
-    for (PendingField pf : pendingFields) total += pf.docsWithField.ramBytesUsed();
+    for (FieldWriter<?> field : fields) {
+      total += field.ramBytesUsed();
+    }
+    for (PendingField pf : pendingFields) {
+      total += pf.docsWithField.ramBytesUsed();
+      if (pf.ordToDict != null) {
+        total += (long) pf.ordToDict.length * Integer.BYTES;
+      }
+    }
     total += hashToOrd.size() * 16L;
     return total;
   }
 
   @Override
   public void close() throws IOException {
-    IOUtils.close(meta, data, tempMappings, dictReadHandle, dictTempOut);
-    IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, tempMappings.getName());
+    IOUtils.close(meta, data, dictReadHandle, dictTempOut);
     if (dictTempName != null) {
       IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, dictTempName);
     }
   }
 
-  // --- Records ---
+  // ---- Inner types ----
 
+  /**
+   * Per-field metadata accumulated during flush/merge, written to disk in {@link #finish()}. The
+   * {@code ordToDict} array is null for empty fields.
+   */
   private record PendingField(
       FieldInfo fieldInfo,
       int size,
       int maxDoc,
       DocsWithFieldSet docsWithField,
-      long mapOffsetInTemp,
-      long mapLength,
+      int[] ordToDict,
       int dictSize,
       long dictDataOffset,
       int dictDimension,
       VectorEncoding dictEncoding) {}
 
-  /** Buffers vectors in memory during indexing. */
+  /** Buffers vectors in memory during indexing (flush path only). */
   private abstract static class FieldWriter<T> extends FlatFieldVectorsWriter<T> {
     final FieldInfo fieldInfo;
     final int dim;
@@ -658,9 +778,10 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
     @Override
     public void addValue(int docID, T vectorValue) throws IOException {
       if (finished) throw new IllegalStateException("already finished");
-      if (docID == lastDocID)
+      if (docID == lastDocID) {
         throw new IllegalArgumentException(
             "VectorValuesField \"" + fieldInfo.name + "\" appears more than once in this document");
+      }
       assert docID > lastDocID;
       docsWithField.add(docID);
       vectors.add(copyValue(vectorValue));

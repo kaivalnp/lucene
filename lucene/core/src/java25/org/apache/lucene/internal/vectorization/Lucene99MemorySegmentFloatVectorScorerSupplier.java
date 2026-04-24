@@ -19,6 +19,7 @@ package org.apache.lucene.internal.vectorization;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.util.Optional;
+import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.FilterIndexInput;
@@ -36,6 +37,7 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
   final int dims;
   final MemorySegment seg;
   final FloatVectorValues values; // to support ordToDoc/getAcceptOrds
+  final HasIndexSlice indexSlice; // to support ordToOffset
 
   /**
    * Return an optional whose value, if present, is the scorer supplier. Otherwise, an empty
@@ -62,6 +64,7 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
   Lucene99MemorySegmentFloatVectorScorerSupplier(MemorySegment seg, FloatVectorValues values) {
     this.seg = seg;
     this.values = values;
+    this.indexSlice = (HasIndexSlice) values;
     this.vectorByteSize = values.getVectorByteLength();
     this.maxOrd = values.size();
     this.dims = values.dimension();
@@ -285,8 +288,8 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
     @Override
     public float score(int node) {
       checkOrdinal(node);
-      long queryAddr = values.ordToOffset(queryOrd);
-      long addr = values.ordToOffset(node);
+      long queryAddr = indexSlice.ordToOffset(queryOrd, vectorByteSize);
+      long addr = indexSlice.ordToOffset(node, vectorByteSize);
       var raw = vectorOp(seg, queryAddr, addr, dims);
       return normalizeRawScore(raw);
     }
@@ -294,14 +297,14 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
     @Override
     public float bulkScore(int[] nodes, float[] scores, int numNodes) {
       int i = 0;
-      long queryAddr = values.ordToOffset(queryOrd);
+      long queryAddr = indexSlice.ordToOffset(queryOrd, vectorByteSize);
       float maxScore = Float.NEGATIVE_INFINITY;
       final int limit = numNodes & ~3;
       for (; i < limit; i += 4) {
-        long offset1 = values.ordToOffset(nodes[i]);
-        long offset2 = values.ordToOffset(nodes[i + 1]);
-        long offset3 = values.ordToOffset(nodes[i + 2]);
-        long offset4 = values.ordToOffset(nodes[i + 3]);
+        long offset1 = indexSlice.ordToOffset(nodes[i], vectorByteSize);
+        long offset2 = indexSlice.ordToOffset(nodes[i + 1], vectorByteSize);
+        long offset3 = indexSlice.ordToOffset(nodes[i + 2], vectorByteSize);
+        long offset4 = indexSlice.ordToOffset(nodes[i + 3], vectorByteSize);
         vectorOp(seg, scratchScores, queryAddr, offset1, offset2, offset3, offset4, dims);
         scores[i + 0] = normalizeRawScore(scratchScores[0]);
         maxScore = Math.max(maxScore, scores[i + 0]);
@@ -315,9 +318,9 @@ public abstract sealed class Lucene99MemorySegmentFloatVectorScorerSupplier
       // Handle remaining 1–3 nodes in bulk (if any)
       int remaining = numNodes - i;
       if (remaining > 0) {
-        long addr1 = values.ordToOffset(nodes[i]);
-        long addr2 = (remaining > 1) ? values.ordToOffset(nodes[i + 1]) : addr1;
-        long addr3 = (remaining > 2) ? values.ordToOffset(nodes[i + 2]) : addr1;
+        long addr1 = indexSlice.ordToOffset(nodes[i], vectorByteSize);
+        long addr2 = (remaining > 1) ? indexSlice.ordToOffset(nodes[i + 1], vectorByteSize) : addr1;
+        long addr3 = (remaining > 2) ? indexSlice.ordToOffset(nodes[i + 2], vectorByteSize) : addr1;
         vectorOp(seg, scratchScores, queryAddr, addr1, addr2, addr3, addr1, dims);
         scores[i] = normalizeRawScore(scratchScores[0]);
         maxScore = Math.max(maxScore, scores[i]);

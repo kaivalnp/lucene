@@ -68,21 +68,6 @@ public abstract class KnnVectorValues {
     return dimension() * getEncoding().byteSize;
   }
 
-  /**
-   * Returns the byte offset within the backing storage for the vector at the given ordinal. The
-   * default implementation assumes vectors are stored contiguously: {@code ord *
-   * getVectorByteLength()}.
-   *
-   * <p>Formats that use indirection (e.g., de-duplicating formats with an ordinal mapping) should
-   * override this to return the correct offset.
-   *
-   * @param ord the vector ordinal
-   * @return the byte offset for the vector
-   */
-  public long ordToOffset(int ord) {
-    return (long) ord * getVectorByteLength();
-  }
-
   /** The vector encoding of these values. */
   public abstract VectorEncoding getEncoding();
 

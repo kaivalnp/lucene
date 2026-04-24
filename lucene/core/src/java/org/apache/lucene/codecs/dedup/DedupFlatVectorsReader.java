@@ -44,14 +44,18 @@ import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.packed.DirectMonotonicReader;
 
-/** Reader for the dedup vector format with per-field dictionary metadata. */
+/**
+ * Reader for the dedup vector format. Each field's vectors are backed by a shared dictionary region
+ * in the .dvd file. Fields with no duplicates delegate to {@link OffHeapFloatVectorValues} for
+ * zero-overhead search. Fields with duplicates use {@link DedupFloatVectorValues} which implements
+ * {@link HasIndexSlice} and overrides {@link HasIndexSlice#ordToOffset(int, int)} to enable
+ * off-heap SIMD scoring through the ordinal indirection.
+ *
+ * @lucene.experimental
+ */
 final class DedupFlatVectorsReader extends FlatVectorsReader {
 
   private final IntObjectHashMap<FieldEntry> fields = new IntObjectHashMap<>();
-
-  /** Eagerly loaded ordToDict mappings, keyed by field number. */
-  private final IntObjectHashMap<int[]> ordToDictCache = new IntObjectHashMap<>();
-
   private final FieldInfos fieldInfos;
   private final IndexInput data;
 
@@ -59,28 +63,10 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     super(scorer);
     this.fieldInfos = state.fieldInfos;
 
-    int versionMeta = -1;
     String metaFileName =
         IndexFileNames.segmentFileName(
             state.segmentInfo.name, state.segmentSuffix, DedupFlatVectorsFormat.META_EXTENSION);
-    try (ChecksumIndexInput meta = state.directory.openChecksumInput(metaFileName)) {
-      Throwable priorE = null;
-      try {
-        versionMeta =
-            CodecUtil.checkIndexHeader(
-                meta,
-                DedupFlatVectorsFormat.META_CODEC_NAME,
-                DedupFlatVectorsFormat.VERSION_START,
-                DedupFlatVectorsFormat.VERSION_CURRENT,
-                state.segmentInfo.getId(),
-                state.segmentSuffix);
-        readFields(meta, state.fieldInfos);
-      } catch (Throwable exception) {
-        priorE = exception;
-      } finally {
-        CodecUtil.checkFooter(meta, priorE);
-      }
-    }
+    int versionMeta = readMeta(state, metaFileName);
 
     String dataFileName =
         IndexFileNames.segmentFileName(
@@ -101,8 +87,6 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
       }
       CodecUtil.retrieveChecksum(dataIn);
       this.data = dataIn;
-
-      // Eagerly load ordToDict mappings now that data file is available
       loadAllOrdToDict();
     } catch (Throwable t) {
       IOUtils.closeWhileSuppressingExceptions(t, dataIn);
@@ -110,9 +94,34 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     }
   }
 
-  private void readFields(ChecksumIndexInput meta, FieldInfos infos) throws IOException {
+  /** Read .dvm metadata. Returns the codec version. */
+  private int readMeta(SegmentReadState state, String metaFileName) throws IOException {
+    int versionMeta = -1;
+    try (ChecksumIndexInput meta = state.directory.openChecksumInput(metaFileName)) {
+      Throwable priorE = null;
+      try {
+        versionMeta =
+            CodecUtil.checkIndexHeader(
+                meta,
+                DedupFlatVectorsFormat.META_CODEC_NAME,
+                DedupFlatVectorsFormat.VERSION_START,
+                DedupFlatVectorsFormat.VERSION_CURRENT,
+                state.segmentInfo.getId(),
+                state.segmentSuffix);
+        readFieldEntries(meta);
+      } catch (Throwable exception) {
+        priorE = exception;
+      } finally {
+        CodecUtil.checkFooter(meta, priorE);
+      }
+    }
+    return versionMeta;
+  }
+
+  /** Parse per-field entries from the .dvm meta stream. */
+  private void readFieldEntries(ChecksumIndexInput meta) throws IOException {
     for (int fieldNumber = meta.readInt(); fieldNumber != -1; fieldNumber = meta.readInt()) {
-      FieldInfo info = infos.fieldInfo(fieldNumber);
+      FieldInfo info = fieldInfos.fieldInfo(fieldNumber);
       if (info == null) {
         throw new CorruptIndexException("Invalid field number: " + fieldNumber, meta);
       }
@@ -121,14 +130,14 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
       int dictSize = meta.readVInt();
       int dictDimension = meta.readVInt();
       int encOrd = meta.readVInt();
-      VectorEncoding dictEncoding = encOrd >= 0 ? VectorEncoding.values()[encOrd] : null;
+      VectorEncoding encoding = encOrd >= 0 ? VectorEncoding.values()[encOrd] : null;
       long dictDataOffset = meta.readVLong();
       long mapOffset = meta.readVLong();
       long mapLength = meta.readVLong();
       OrdToDocDISIReaderConfiguration ordToDoc =
           OrdToDocDISIReaderConfiguration.fromStoredMeta(meta, size);
 
-      int vectorByteSize = dictEncoding != null ? dictDimension * dictEncoding.byteSize : 0;
+      int vectorByteSize = encoding != null ? dictDimension * encoding.byteSize : 0;
       fields.put(
           info.number,
           new FieldEntry(
@@ -136,16 +145,20 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
               simFunc,
               dictSize,
               dictDimension,
-              dictEncoding,
+              encoding,
               dictDataOffset,
               vectorByteSize,
               mapOffset,
               mapLength,
-              ordToDoc));
+              ordToDoc,
+              null));
     }
   }
 
-  /** Load all ordToDict mappings eagerly. Called once after data file is opened. */
+  /**
+   * Eagerly load all ordToDict mappings from the .dvd file into the corresponding FieldEntry.
+   * Called once at construction time after the data file is opened.
+   */
   private void loadAllOrdToDict() throws IOException {
     for (var cursor : fields) {
       FieldEntry entry = cursor.value;
@@ -155,63 +168,47 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
         for (int i = 0; i < entry.size; i++) {
           ordToDict[i] = slice.readVInt();
         }
-        ordToDictCache.put(cursor.key, ordToDict);
+        // Replace the entry with one that includes the loaded mapping
+        fields.put(cursor.key, entry.withOrdToDict(ordToDict));
       }
     }
   }
 
-  /** Get the cached ordToDict for a field, or null if identity mapping. */
-  private int[] getOrdToDict(int fieldNumber) {
-    return ordToDictCache.get(fieldNumber);
-  }
-
-  private FieldEntry getFieldEntry(String field) {
-    FieldInfo info = fieldInfos.fieldInfo(field);
-    if (info == null) throw new IllegalArgumentException("field=\"" + field + "\" not found");
-    FieldEntry entry = fields.get(info.number);
-    if (entry == null) throw new IllegalArgumentException("field=\"" + field + "\" has no entry");
-    return entry;
-  }
+  // ---- Public API ----
 
   @Override
   public FloatVectorValues getFloatVectorValues(String field) throws IOException {
-    FieldInfo info = fieldInfos.fieldInfo(field);
     FieldEntry entry = getFieldEntry(field);
-    int[] ordToDict = getOrdToDict(info.number);
-    if (ordToDict == null) {
-      // Identity mapping — use the same off-heap implementation as the base format
-      long vectorDataLength = (long) entry.dictSize * entry.vectorByteSize;
+    if (entry.ordToDict == null) {
+      // No duplicates — delegate to the standard off-heap implementation (zero overhead)
       return OffHeapFloatVectorValues.load(
           entry.simFunc,
           vectorScorer,
           entry.ordToDoc,
-          entry.dictEncoding,
+          entry.encoding,
           entry.dictDimension,
           entry.dictDataOffset,
-          vectorDataLength,
+          entry.dictDataLength(),
           data);
     }
-    return new DedupFloatVectorValues(entry, ordToDict, data, vectorScorer);
+    return new DedupFloatVectorValues(entry, data, vectorScorer);
   }
 
   @Override
   public ByteVectorValues getByteVectorValues(String field) throws IOException {
-    FieldInfo info = fieldInfos.fieldInfo(field);
     FieldEntry entry = getFieldEntry(field);
-    int[] ordToDict = getOrdToDict(info.number);
-    if (ordToDict == null) {
-      long vectorDataLength = (long) entry.dictSize * entry.vectorByteSize;
+    if (entry.ordToDict == null) {
       return OffHeapByteVectorValues.load(
           entry.simFunc,
           vectorScorer,
           entry.ordToDoc,
-          entry.dictEncoding,
+          entry.encoding,
           entry.dictDimension,
           entry.dictDataOffset,
-          vectorDataLength,
+          entry.dictDataLength(),
           data);
     }
-    return new DedupByteVectorValues(entry, ordToDict, data, vectorScorer);
+    return new DedupByteVectorValues(entry, data, vectorScorer);
   }
 
   @Override
@@ -244,9 +241,10 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
   @Override
   public long ramBytesUsed() {
     long total = fields.ramBytesUsed();
-    for (var cursor : ordToDictCache) {
-      if (cursor.value != null) {
-        total += (long) cursor.value.length * Integer.BYTES;
+    for (var cursor : fields) {
+      FieldEntry entry = cursor.value;
+      if (entry.ordToDict != null) {
+        total += (long) entry.ordToDict.length * Integer.BYTES;
       }
     }
     return total;
@@ -259,63 +257,125 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     return Map.of("vec", (long) entry.size * entry.vectorByteSize);
   }
 
-  // --- Inner types ---
+  private FieldEntry getFieldEntry(String field) {
+    FieldInfo info = fieldInfos.fieldInfo(field);
+    if (info == null) {
+      throw new IllegalArgumentException("field=\"" + field + "\" not found");
+    }
+    FieldEntry entry = fields.get(info.number);
+    if (entry == null) {
+      throw new IllegalArgumentException("field=\"" + field + "\" has no dedup entry");
+    }
+    return entry;
+  }
 
+  // ---- Inner types ----
+
+  /**
+   * Per-field metadata read from .dvm. The {@code ordToDict} array is null until eagerly loaded
+   * from .dvd at construction time, and remains null for fields with no duplicates (identity
+   * mapping).
+   */
   private record FieldEntry(
       int size,
       VectorSimilarityFunction simFunc,
       int dictSize,
       int dictDimension,
-      VectorEncoding dictEncoding,
+      VectorEncoding encoding,
       long dictDataOffset,
       int vectorByteSize,
       long mapOffset,
       long mapLength,
-      OrdToDocDISIReaderConfiguration ordToDoc) {}
+      OrdToDocDISIReaderConfiguration ordToDoc,
+      int[] ordToDict) {
 
+    /** Total byte length of the dictionary region for this field. */
+    long dictDataLength() {
+      return (long) dictSize * vectorByteSize;
+    }
+
+    /** Return a copy of this entry with the ordToDict mapping populated. */
+    FieldEntry withOrdToDict(int[] ordToDict) {
+      return new FieldEntry(
+          size,
+          simFunc,
+          dictSize,
+          dictDimension,
+          encoding,
+          dictDataOffset,
+          vectorByteSize,
+          mapOffset,
+          mapLength,
+          ordToDoc,
+          ordToDict);
+    }
+  }
+
+  /**
+   * Float vector values backed by a shared dictionary with ordinal indirection. Implements {@link
+   * HasIndexSlice} so the MemorySegment scorer can operate directly on the memory-mapped dictionary
+   * using {@link #ordToOffset(int, int)} for address translation.
+   */
   private static final class DedupFloatVectorValues extends FloatVectorValues
       implements HasIndexSlice {
+
     private final int size;
     private final int dimension;
-    private final long dictDataOffset;
     private final int vectorByteSize;
     private final int[] ordToDict;
     private final VectorSimilarityFunction simFunc;
     private final OrdToDocDISIReaderConfiguration ordToDocConfig;
-    private final IndexInput dataSlice;
+    private final FlatVectorsScorer flatScorer;
+    private final IndexInput dictSlice;
+    private final DirectMonotonicReader ordToDocReader;
     private final float[] value;
     private int lastOrd = -1;
-    private final DirectMonotonicReader ordToDocReader;
-    private final FlatVectorsScorer flatScorer;
 
-    DedupFloatVectorValues(
-        FieldEntry entry, int[] ordToDict, IndexInput data, FlatVectorsScorer flatScorer)
+    DedupFloatVectorValues(FieldEntry entry, IndexInput data, FlatVectorsScorer flatScorer)
         throws IOException {
-      this.size = entry.size;
-      this.dimension = entry.dictDimension;
-      this.dictDataOffset = entry.dictDataOffset;
-      this.vectorByteSize = entry.vectorByteSize;
+      this(
+          entry.size,
+          entry.dictDimension,
+          entry.vectorByteSize,
+          entry.ordToDict,
+          entry.simFunc,
+          entry.ordToDoc,
+          flatScorer,
+          data.slice("dedup-dict", entry.dictDataOffset, entry.dictDataLength()),
+          (!entry.ordToDoc.isDense() && !entry.ordToDoc.isEmpty())
+              ? entry.ordToDoc.getDirectMonotonicReader(data)
+              : null);
+    }
+
+    private DedupFloatVectorValues(
+        int size,
+        int dimension,
+        int vectorByteSize,
+        int[] ordToDict,
+        VectorSimilarityFunction simFunc,
+        OrdToDocDISIReaderConfiguration ordToDocConfig,
+        FlatVectorsScorer flatScorer,
+        IndexInput dictSlice,
+        DirectMonotonicReader ordToDocReader) {
+      this.size = size;
+      this.dimension = dimension;
+      this.vectorByteSize = vectorByteSize;
       this.ordToDict = ordToDict;
-      this.simFunc = entry.simFunc;
-      this.ordToDocConfig = entry.ordToDoc;
-      this.dataSlice =
-          data.slice(
-              "dedup-dict", entry.dictDataOffset, (long) entry.dictSize * entry.vectorByteSize);
-      this.value = new float[dimension];
+      this.simFunc = simFunc;
+      this.ordToDocConfig = ordToDocConfig;
       this.flatScorer = flatScorer;
-      this.ordToDocReader =
-          (!ordToDocConfig.isDense() && !ordToDocConfig.isEmpty())
-              ? ordToDocConfig.getDirectMonotonicReader(data)
-              : null;
+      this.dictSlice = dictSlice;
+      this.ordToDocReader = ordToDocReader;
+      this.value = new float[dimension];
     }
 
     @Override
     public IndexInput getSlice() {
-      return dataSlice;
+      return dictSlice;
     }
 
     @Override
-    public long ordToOffset(int ord) {
+    public long ordToOffset(int ord, int vectorByteSize) {
       return (long) ordToDict[ord] * vectorByteSize;
     }
 
@@ -332,8 +392,8 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     @Override
     public float[] vectorValue(int ord) throws IOException {
       if (ord == lastOrd) return value;
-      dataSlice.seek(ordToOffset(ord));
-      dataSlice.readFloats(value, 0, dimension);
+      dictSlice.seek(ordToOffset(ord, vectorByteSize));
+      dictSlice.readFloats(value, 0, dimension);
       lastOrd = ord;
       return value;
     }
@@ -353,41 +413,13 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
       return new DedupFloatVectorValues(
           size,
           dimension,
-          dictDataOffset,
           vectorByteSize,
           ordToDict,
           simFunc,
           ordToDocConfig,
-          dataSlice.clone(),
-          flatScorer);
-    }
-
-    /** Copy constructor with direct fields. */
-    private DedupFloatVectorValues(
-        int size,
-        int dimension,
-        long dictDataOffset,
-        int vectorByteSize,
-        int[] ordToDict,
-        VectorSimilarityFunction simFunc,
-        OrdToDocDISIReaderConfiguration ordToDocConfig,
-        IndexInput dataSlice,
-        FlatVectorsScorer flatScorer)
-        throws IOException {
-      this.size = size;
-      this.dimension = dimension;
-      this.dictDataOffset = dictDataOffset;
-      this.vectorByteSize = vectorByteSize;
-      this.ordToDict = ordToDict;
-      this.simFunc = simFunc;
-      this.ordToDocConfig = ordToDocConfig;
-      this.dataSlice = dataSlice;
-      this.value = new float[dimension];
-      this.flatScorer = flatScorer;
-      this.ordToDocReader =
-          (!ordToDocConfig.isDense() && !ordToDocConfig.isEmpty())
-              ? ordToDocConfig.getDirectMonotonicReader(dataSlice)
-              : null;
+          flatScorer,
+          dictSlice.clone(),
+          ordToDocReader);
     }
 
     @Override
@@ -410,49 +442,70 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     }
   }
 
+  /**
+   * Byte vector values backed by a shared dictionary with ordinal indirection. Mirror of {@link
+   * DedupFloatVectorValues} for byte-encoded vectors.
+   */
   private static final class DedupByteVectorValues extends ByteVectorValues
       implements HasIndexSlice {
+
     private final int size;
     private final int dimension;
-    private final long dictDataOffset;
     private final int vectorByteSize;
     private final int[] ordToDict;
     private final VectorSimilarityFunction simFunc;
     private final OrdToDocDISIReaderConfiguration ordToDocConfig;
-    private final IndexInput dataSlice;
+    private final FlatVectorsScorer flatScorer;
+    private final IndexInput dictSlice;
+    private final DirectMonotonicReader ordToDocReader;
     private final byte[] value;
     private int lastOrd = -1;
-    private final DirectMonotonicReader ordToDocReader;
-    private final FlatVectorsScorer flatScorer;
 
-    DedupByteVectorValues(
-        FieldEntry entry, int[] ordToDict, IndexInput data, FlatVectorsScorer flatScorer)
+    DedupByteVectorValues(FieldEntry entry, IndexInput data, FlatVectorsScorer flatScorer)
         throws IOException {
-      this.size = entry.size;
-      this.dimension = entry.dictDimension;
-      this.dictDataOffset = entry.dictDataOffset;
-      this.vectorByteSize = entry.vectorByteSize;
+      this(
+          entry.size,
+          entry.dictDimension,
+          entry.vectorByteSize,
+          entry.ordToDict,
+          entry.simFunc,
+          entry.ordToDoc,
+          flatScorer,
+          data.slice("dedup-dict", entry.dictDataOffset, entry.dictDataLength()),
+          (!entry.ordToDoc.isDense() && !entry.ordToDoc.isEmpty())
+              ? entry.ordToDoc.getDirectMonotonicReader(data)
+              : null);
+    }
+
+    private DedupByteVectorValues(
+        int size,
+        int dimension,
+        int vectorByteSize,
+        int[] ordToDict,
+        VectorSimilarityFunction simFunc,
+        OrdToDocDISIReaderConfiguration ordToDocConfig,
+        FlatVectorsScorer flatScorer,
+        IndexInput dictSlice,
+        DirectMonotonicReader ordToDocReader) {
+      this.size = size;
+      this.dimension = dimension;
+      this.vectorByteSize = vectorByteSize;
       this.ordToDict = ordToDict;
-      this.simFunc = entry.simFunc;
-      this.ordToDocConfig = entry.ordToDoc;
-      this.dataSlice =
-          data.slice(
-              "dedup-dict", entry.dictDataOffset, (long) entry.dictSize * entry.vectorByteSize);
-      this.value = new byte[dimension];
+      this.simFunc = simFunc;
+      this.ordToDocConfig = ordToDocConfig;
       this.flatScorer = flatScorer;
-      this.ordToDocReader =
-          (!ordToDocConfig.isDense() && !ordToDocConfig.isEmpty())
-              ? ordToDocConfig.getDirectMonotonicReader(data)
-              : null;
+      this.dictSlice = dictSlice;
+      this.ordToDocReader = ordToDocReader;
+      this.value = new byte[dimension];
     }
 
     @Override
     public IndexInput getSlice() {
-      return dataSlice;
+      return dictSlice;
     }
 
     @Override
-    public long ordToOffset(int ord) {
+    public long ordToOffset(int ord, int vectorByteSize) {
       return (long) ordToDict[ord] * vectorByteSize;
     }
 
@@ -469,8 +522,8 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     @Override
     public byte[] vectorValue(int ord) throws IOException {
       if (ord == lastOrd) return value;
-      dataSlice.seek(ordToOffset(ord));
-      dataSlice.readBytes(value, 0, dimension);
+      dictSlice.seek(ordToOffset(ord, vectorByteSize));
+      dictSlice.readBytes(value, 0, dimension);
       lastOrd = ord;
       return value;
     }
@@ -490,40 +543,13 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
       return new DedupByteVectorValues(
           size,
           dimension,
-          dictDataOffset,
           vectorByteSize,
           ordToDict,
           simFunc,
           ordToDocConfig,
-          dataSlice.clone(),
-          flatScorer);
-    }
-
-    private DedupByteVectorValues(
-        int size,
-        int dimension,
-        long dictDataOffset,
-        int vectorByteSize,
-        int[] ordToDict,
-        VectorSimilarityFunction simFunc,
-        OrdToDocDISIReaderConfiguration ordToDocConfig,
-        IndexInput dataSlice,
-        FlatVectorsScorer flatScorer)
-        throws IOException {
-      this.size = size;
-      this.dimension = dimension;
-      this.dictDataOffset = dictDataOffset;
-      this.vectorByteSize = vectorByteSize;
-      this.ordToDict = ordToDict;
-      this.simFunc = simFunc;
-      this.ordToDocConfig = ordToDocConfig;
-      this.dataSlice = dataSlice;
-      this.value = new byte[dimension];
-      this.flatScorer = flatScorer;
-      this.ordToDocReader =
-          (!ordToDocConfig.isDense() && !ordToDocConfig.isEmpty())
-              ? ordToDocConfig.getDirectMonotonicReader(dataSlice)
-              : null;
+          flatScorer,
+          dictSlice.clone(),
+          ordToDocReader);
     }
 
     @Override
