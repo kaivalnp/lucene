@@ -386,4 +386,11 @@ public class TestDedupFlatVectorsFormat extends LuceneTestCase {
       }
     }
   }
+
+  // TODO: add a test that verifies dead dict entries (source dict ords whose referencing docs
+  // have all been deleted) are dropped when a dedup-written segment is merged. The lazy dedup-
+  // aware merge path only touches source dict ords that live docs reference, so dead vectors
+  // should not accumulate across merge cycles. Checking this from outside the package needs
+  // either a package-private accessor for dictSize or a reliable way to unwrap the asserting-
+  // codec chain to reach DedupFlatVectorsReader — both deferred for now.
 }

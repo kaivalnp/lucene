@@ -47,8 +47,18 @@ import org.apache.lucene.index.SegmentWriteState;
  *   <li>-1 sentinel marking end of fields
  * </ul>
  *
- * <p>During merge, vectors are streamed one at a time. Only a hash map of {@code long hash → int
- * dictOrd} is held in memory (~12 bytes per unique vector). Vector data is never buffered.
+ * <p>The writer performs no temporary-file IO. Dictionary bytes stream directly into the main
+ * {@code .dvd} output. Hash-collision verification uses already-resident sources: on-heap typed
+ * arrays during flush, and already-open {@link org.apache.lucene.codecs.KnnVectorsReader}s from
+ * {@link org.apache.lucene.index.MergeState} during merge.
+ *
+ * <p>When a source segment being merged was itself written with this format, the merge path skips
+ * per-doc hashing through a lazy {@code sourceDictOrd → targetDictOrd} cache and a same-sub int-ord
+ * shortcut on hash collision. This also drops source dict entries whose referencing docs have all
+ * been deleted — their dict ords are never touched, so dead vectors do not accumulate across merge
+ * cycles.
+ *
+ * <p>See {@code lucene/dev-docs/dedup-vectors-format-design.md} for the full design.
  *
  * @lucene.experimental
  */

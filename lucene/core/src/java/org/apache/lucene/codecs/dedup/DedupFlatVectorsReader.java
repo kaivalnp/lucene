@@ -39,6 +39,10 @@ import org.apache.lucene.internal.hppc.IntObjectHashMap;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.FileDataHint;
+import org.apache.lucene.store.FileTypeHint;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
@@ -59,6 +63,13 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
   private final FieldInfos fieldInfos;
   private final IndexInput data;
 
+  /**
+   * IO context used to open {@link #data}. Captured so that {@link #getMergeInstance()} can switch
+   * the underlying access hint to {@link DataAccessHint#SEQUENTIAL} for the duration of a merge,
+   * and {@link #finishMerge()} can revert it back to the original context for search.
+   */
+  private final IOContext dataContext;
+
   DedupFlatVectorsReader(SegmentReadState state, FlatVectorsScorer scorer) throws IOException {
     super(scorer);
     this.fieldInfos = state.fieldInfos;
@@ -71,7 +82,8 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     String dataFileName =
         IndexFileNames.segmentFileName(
             state.segmentInfo.name, state.segmentSuffix, DedupFlatVectorsFormat.DATA_EXTENSION);
-    IndexInput dataIn = state.directory.openInput(dataFileName, state.context);
+    this.dataContext = state.context.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS);
+    IndexInput dataIn = state.directory.openInput(dataFileName, dataContext);
     try {
       int versionData =
           CodecUtil.checkIndexHeader(
@@ -223,14 +235,81 @@ final class DedupFlatVectorsReader extends FlatVectorsReader {
     return vectorScorer.getRandomVectorScorer(entry.simFunc, getByteVectorValues(field), target);
   }
 
+  // ---- Package-private accessors for merge-path optimization ----
+  //
+  // These let a dedup-aware writer reuse this reader's existing dictionary + ordToDict mapping
+  // instead of hashing each per-doc vector individually at merge time. See
+  // DedupFlatVectorsWriter#buildFloatSubs / #buildByteSubs.
+
+  /**
+   * Return the per-doc {@code ordToDict} mapping for the given field, or {@code null} if the field
+   * has no duplicates (identity mapping — no value in trying to skip hashing since there are no
+   * duplicates to collapse).
+   */
+  int[] getOrdToDict(String field) {
+    return getFieldEntry(field).ordToDict;
+  }
+
+  /**
+   * Return a random-access view over the {@code dictSize} unique float vectors in the field's
+   * dictionary, indexed by source dict ord. The merge writer walks this once, hashes each vector
+   * into its own target dict, and builds a {@code sourceDictOrd → targetDictOrd} mapping — which it
+   * then uses to resolve every per-doc ord with a single array lookup (no per-doc hashing or
+   * equality check).
+   *
+   * <p>Returns {@code null} if the field's encoding is not float32.
+   */
+  FloatVectorValues getDictFloatVectorValues(String field) throws IOException {
+    FieldEntry entry = getFieldEntry(field);
+    if (entry.encoding != VectorEncoding.FLOAT32) {
+      return null;
+    }
+    IndexInput dictSlice = data.slice("dedup-dict", entry.dictDataOffset, entry.dictDataLength());
+    return new OffHeapFloatVectorValues.DenseOffHeapVectorValues(
+        entry.dictDimension,
+        entry.dictSize,
+        dictSlice,
+        entry.vectorByteSize,
+        vectorScorer,
+        entry.simFunc);
+  }
+
+  /** Byte-encoded mirror of {@link #getDictFloatVectorValues(String)}. */
+  ByteVectorValues getDictByteVectorValues(String field) throws IOException {
+    FieldEntry entry = getFieldEntry(field);
+    if (entry.encoding != VectorEncoding.BYTE) {
+      return null;
+    }
+    IndexInput dictSlice = data.slice("dedup-dict", entry.dictDataOffset, entry.dictDataLength());
+    return new OffHeapByteVectorValues.DenseOffHeapVectorValues(
+        entry.dictDimension,
+        entry.dictSize,
+        dictSlice,
+        entry.vectorByteSize,
+        vectorScorer,
+        entry.simFunc);
+  }
+
   @Override
   public void checkIntegrity() throws IOException {
     CodecUtil.checksumEntireFile(data);
   }
 
   @Override
-  public FlatVectorsReader getMergeInstance() {
+  public FlatVectorsReader getMergeInstance() throws IOException {
+    // During merge, the dedup writer walks each source segment's vectors mostly in forward order
+    // (via DocIDMerger). Switch the IO hint to SEQUENTIAL so the directory can enable readahead.
+    // Occasional random-access reads for hash-collision verification target recently-read vectors,
+    // which typically remain resident in the page cache, so they don't materially suffer from the
+    // SEQUENTIAL hint.
+    data.updateIOContext(dataContext.withHints(DataAccessHint.SEQUENTIAL));
     return this;
+  }
+
+  @Override
+  public void finishMerge() throws IOException {
+    // Revert the access hint to the original context used for search.
+    data.updateIOContext(dataContext);
   }
 
   @Override

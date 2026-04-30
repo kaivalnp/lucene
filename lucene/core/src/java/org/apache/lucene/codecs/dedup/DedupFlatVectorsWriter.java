@@ -17,8 +17,6 @@
 
 package org.apache.lucene.codecs.dedup;
 
-import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -30,10 +28,9 @@ import org.apache.lucene.codecs.KnnVectorsWriter;
 import org.apache.lucene.codecs.hnsw.FlatFieldVectorsWriter;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.hnsw.FlatVectorsWriter;
-import org.apache.lucene.codecs.lucene95.OffHeapByteVectorValues;
-import org.apache.lucene.codecs.lucene95.OffHeapFloatVectorValues;
 import org.apache.lucene.codecs.lucene95.OrdToDocDISIReaderConfiguration;
 import org.apache.lucene.index.ByteVectorValues;
+import org.apache.lucene.index.DocIDMerger;
 import org.apache.lucene.index.DocsWithFieldSet;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
@@ -44,28 +41,43 @@ import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Sorter;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.internal.hppc.LongIntHashMap;
-import org.apache.lucene.store.DataAccessHint;
-import org.apache.lucene.store.FileDataHint;
-import org.apache.lucene.store.FileTypeHint;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.RamUsageEstimator;
-import org.apache.lucene.util.hnsw.CloseableRandomVectorScorerSupplier;
-import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
-import org.apache.lucene.util.hnsw.UpdateableRandomVectorScorer;
 
 /**
  * Writer that de-duplicates vectors across all fields in a segment. Unique vectors are stored in a
  * contiguous dictionary region in the .dvd file. Each field stores a compact ordinal mapping from
  * document ords to dictionary ords.
  *
- * <p>Merge uses a two-pass approach per field. Pass 1 writes all vectors (including duplicates) to
- * a temp file. Pass 2 reads back from the closed temp file, hashes, deduplicates against the
- * dictionary, and builds the ordToDict mapping. Only the hash map (~16 bytes/unique vector) and the
- * ordinal mapping (4 bytes/doc) are held in memory.
+ * <p>This writer does no temporary-file IO and avoids materializing {@code byte[]} copies of float
+ * vectors. Dictionary bytes are streamed directly into the main {@code .dvd} output; hash-
+ * collision verification operates on typed arrays sourced from memory or already-open segment
+ * readers:
+ *
+ * <ul>
+ *   <li><b>Flush</b>: each field's vectors are already on-heap in {@link FieldWriter#vectors}. On a
+ *       hash hit, the incoming typed vector is compared directly with the on-heap candidate via
+ *       {@link Arrays#equals(float[], float[])} / {@link Arrays#equals(byte[], byte[])}.
+ *   <li><b>Merge</b>: each field's per-segment readers (from {@link MergeState}) are kept cached in
+ *       {@link #mergeFieldSubs} for the lifetime of the shared-dict group. On a hash hit the
+ *       candidate is re-fetched from its source segment via a dedicated {@code verifyValues}
+ *       handle, so random-access verification reads never alias the iteration buffer.
+ *   <li><b>Merge, dedup-aware fast path</b>: when a source segment is itself written with {@link
+ *       DedupFlatVectorsFormat} and the field has duplicates, per-doc iteration consults a lazy
+ *       {@code srcDictOrd → targetDictOrd} cache on the sub. Each source dict ord is hashed at most
+ *       once, regardless of how many live docs reference it — and dict entries whose docs have all
+ *       been deleted are never touched, so dead vectors are naturally dropped at merge. Within the
+ *       same sub, equality on hash collision is decided by comparing source dict ords (the source
+ *       format guarantees distinct source dict ords correspond to distinct vectors); cross-sub
+ *       collisions still fall back to full byte equality.
+ * </ul>
+ *
+ * <p>Floats are hashed directly on their {@link Float#floatToRawIntBits(float)} representation with
+ * no intermediate {@code byte[]} materialization for hashing or for the typed-array equality used
+ * during collision verification. Writing floats to {@code data} uses a reusable little- endian
+ * {@link java.nio.ByteBuffer} (same approach as {@code Lucene99FlatVectorsWriter}).
  *
  * @lucene.experimental
  */
@@ -86,28 +98,44 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
   private final LongIntHashMap hashToOrd = new LongIntHashMap();
 
   /**
-   * Dictionary vectors are written to a temp file, then bulk-copied to {@code data} at finish time.
-   * During flush, this file is also read back for collision verification (with mode toggling).
-   * During merge, collision verification reads from the per-field temp file instead.
+   * Merge-only: per-merge-field cached list of source-segment sub readers. Index is {@code
+   * mergeFieldIdx}, as recorded in {@link #dictSources} for any dict ord contributed by the merge
+   * path. Kept alive until the shared-dict group ends (different dim/encoding) or {@link #finish()}
+   * / {@link #close()}.
+   *
+   * <p>The cached {@link DedupSub}s hold references to {@code MergeState}'s readers (they do not
+   * own them); {@link MergeState} is responsible for closing its readers.
    */
-  private IndexOutput dictTempOut;
+  private final List<List<DedupSub<?>>> mergeFieldSubs = new ArrayList<>();
 
-  private String dictTempName;
-
-  /** Read handle for collision verification. Opened lazily, closed on next write. */
-  private IndexInput dictReadHandle;
-
+  /** Number of dict ords in the current shared-dict group. */
   private int dictSize;
+
   private long dictDataOffset;
   private int dictDimension;
   private VectorEncoding dictEncoding;
-  private int vectorByteSize;
+  private boolean dictInitialized;
 
-  /** Reusable byte buffer for serializing float vectors. Used for both hashing and writing. */
-  private byte[] vectorBytes;
+  /**
+   * Reusable little-endian {@link ByteBuffer} sized to one float vector (for the current shared-
+   * dict group's dim). Rewritten in-place per write. Null for byte-encoded groups. Same approach as
+   * {@code Lucene99FlatVectorsWriter.writeFloat32Vectors}.
+   */
+  private ByteBuffer floatWriteBuffer;
 
-  /** Reusable byte buffer for bulk collision verification reads. */
-  private byte[] compareBytes;
+  /**
+   * For each dictOrd in the current shared-dict group, the source-location descriptor needed to
+   * re-fetch the vector during collision verification. Bit layout:
+   *
+   * <ul>
+   *   <li>Flush (bit 63 = 0): {@code (flushFieldIdx << 32) | inFieldOrd}
+   *   <li>Merge (bit 63 = 1): {@code (mergeFieldIdx << 48) | (subIdx << 32) | sourceOrd}
+   * </ul>
+   *
+   * Sign bit distinguishes the two. {@code mergeFieldIdx} gets 15 bits and {@code subIdx} gets 16
+   * bits — both are well under their limits in any realistic scenario.
+   */
+  private long[] dictSources;
 
   private boolean finished;
 
@@ -155,14 +183,14 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
 
   @Override
   public void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
-    for (FieldWriter<?> field : fields) {
-      flushField(field, maxDoc, sortMap);
+    for (int fieldIdx = 0; fieldIdx < fields.size(); fieldIdx++) {
+      FieldWriter<?> field = fields.get(fieldIdx);
+      flushField(field, fieldIdx, maxDoc, sortMap);
       field.finish();
     }
   }
 
-  @SuppressWarnings("unchecked")
-  private <T> void flushField(FieldWriter<T> field, int maxDoc, Sorter.DocMap sortMap)
+  private <T> void flushField(FieldWriter<T> field, int fieldIdx, int maxDoc, Sorter.DocMap sortMap)
       throws IOException {
     List<T> vectors = field.vectors;
     DocsWithFieldSet docsWithField = field.docsWithField;
@@ -185,7 +213,6 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
 
     initDict(field.fieldInfo);
 
-    // Apply sort map if needed
     int[] ordMap = null;
     if (sortMap != null) {
       ordMap = new int[size];
@@ -194,11 +221,11 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
       docsWithField = newDocsWithField;
     }
 
-    // Dedup and build mapping in memory (flush buffers are bounded by indexing buffer size)
     int[] ordToDict = new int[size];
     for (int newOrd = 0; newOrd < size; newOrd++) {
       int srcOrd = ordMap != null ? ordMap[newOrd] : newOrd;
-      ordToDict[newOrd] = addToDict(vectors.get(srcOrd));
+      T vec = vectors.get(srcOrd);
+      ordToDict[newOrd] = addFlushVector(fieldIdx, srcOrd, vec);
     }
 
     pendingFields.add(
@@ -214,260 +241,104 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
             dictEncoding));
   }
 
-  // ---- Merge path (two-pass) ----
-
   /**
-   * Pass 1: iterate merged vector values and write all vectors (including duplicates) to a temp
-   * file. Returns the number of vectors written and populates {@code docsWithField}.
+   * Flush-path dedup. Incoming and candidate vectors are both typed arrays; comparison is a direct
+   * {@link Arrays#equals} with no byte serialization on either side. On a miss, the vector is
+   * written directly to {@code data} (without materializing an intermediate {@code byte[]}).
    */
-  private int writeMergedVectorsToTemp(
-      FieldInfo fieldInfo,
-      MergeState mergeState,
-      IndexOutput tempOut,
-      DocsWithFieldSet docsWithField)
+  private <T> int addFlushVector(int fieldIdx, int inFieldOrd, T vec) throws IOException {
+    long hash;
+    if (vec instanceof float[] f) {
+      hash = hashFloats(f);
+    } else if (vec instanceof byte[] b) {
+      hash = hashBytes(b, b.length);
+    } else {
+      throw new AssertionError("Unexpected vector type: " + vec.getClass());
+    }
+
+    for (int probe = 0; ; probe++) {
+      long probeHash = hash + probe;
+      int existing = hashToOrd.getOrDefault(probeHash, -1);
+      if (existing < 0) {
+        int dictOrd = dictSize++;
+        hashToOrd.put(probeHash, dictOrd);
+        writeVectorToData(vec);
+        recordFlushSource(dictOrd, fieldIdx, inFieldOrd);
+        return dictOrd;
+      }
+      if (typedVectorsEqual(vec, dictSourceVector(existing))) {
+        return existing;
+      }
+      // Collision — continue probing.
+    }
+  }
+
+  // ---- Merge path ----
+
+  @Override
+  public void mergeOneFlatVectorField(FieldInfo fieldInfo, MergeState mergeState)
       throws IOException {
-    VectorEncoding encoding = fieldInfo.getVectorEncoding();
-    int byteSize = fieldInfo.getVectorDimension() * encoding.byteSize;
-    KnnVectorValues merged =
-        switch (encoding) {
-          case FLOAT32 ->
-              KnnVectorsWriter.MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
-          case BYTE ->
-              KnnVectorsWriter.MergedVectorValues.mergeByteVectorValues(fieldInfo, mergeState);
-        };
+    initDict(fieldInfo);
+    if (fieldInfo.getVectorEncoding() == VectorEncoding.FLOAT32) {
+      mergeFloatField(fieldInfo, mergeState);
+    } else {
+      mergeByteField(fieldInfo, mergeState);
+    }
+  }
 
+  private void mergeFloatField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
+    int maxDoc = segmentWriteState.segmentInfo.maxDoc();
+    int mergeFieldIdx = mergeFieldSubs.size();
+    List<DedupSub<?>> subs = new ArrayList<>();
+    mergeFieldSubs.add(subs);
+    buildFloatSubs(subs, fieldInfo, mergeState);
+
+    if (subs.isEmpty()) {
+      pendingFields.add(
+          new PendingField(
+              fieldInfo,
+              0,
+              maxDoc,
+              new DocsWithFieldSet(),
+              null,
+              dictSize,
+              dictDataOffset,
+              dictDimension,
+              dictEncoding));
+      return;
+    }
+
+    DocIDMerger<DedupSub<?>> merger = DocIDMerger.of(subs, mergeState.needsIndexSort);
+    DocsWithFieldSet docsWithField = new DocsWithFieldSet();
+    int[] ordToDictTmp = new int[16];
     int count = 0;
-    KnnVectorValues.DocIndexIterator iter = merged.iterator();
-    for (int doc = iter.nextDoc(); doc != NO_MORE_DOCS; doc = iter.nextDoc()) {
-      byte[] rawBytes = vectorToBytes(merged, iter.index());
-      tempOut.writeBytes(rawBytes, 0, byteSize);
-      docsWithField.add(doc);
-      count++;
-    }
-    return count;
-  }
 
-  @Override
-  public void mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
-    initDict(fieldInfo);
-    int maxDoc = segmentWriteState.segmentInfo.maxDoc();
-    int byteSize = fieldInfo.getVectorDimension() * fieldInfo.getVectorEncoding().byteSize;
-
-    // Pass 1: write all vectors to a temp file.
-    IndexOutput tempOut =
-        segmentWriteState.directory.createTempOutput(
-            data.getName(), "dedup-merge", segmentWriteState.context);
-    String tempName = tempOut.getName();
-    try {
-      DocsWithFieldSet docsWithField = new DocsWithFieldSet();
-      int count = writeMergedVectorsToTemp(fieldInfo, mergeState, tempOut, docsWithField);
-      CodecUtil.writeFooter(tempOut);
-      IOUtils.close(tempOut);
-
-      if (count == 0) {
-        pendingFields.add(
-            new PendingField(
-                fieldInfo,
-                0,
-                maxDoc,
-                docsWithField,
-                null,
-                dictSize,
-                dictDataOffset,
-                dictDimension,
-                dictEncoding));
-        return;
-      }
-
-      // Pass 2: dedup from the closed temp file.
-      try (IndexInput tempIn =
-          segmentWriteState.directory.openInput(tempName, segmentWriteState.context)) {
-        dedupFromTempFile(fieldInfo, tempIn, count, maxDoc, docsWithField, byteSize);
-      }
-    } finally {
-      IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, tempName);
-    }
-  }
-
-  @Override
-  public CloseableRandomVectorScorerSupplier mergeOneFieldToIndex(
-      FieldInfo fieldInfo, MergeState mergeState) throws IOException {
-    initDict(fieldInfo);
-    int maxDoc = segmentWriteState.segmentInfo.maxDoc();
-    VectorEncoding encoding = fieldInfo.getVectorEncoding();
-    int byteSize = fieldInfo.getVectorDimension() * encoding.byteSize;
-
-    // Pass 1: write all vectors to a temp file (also used as the HNSW scorer source).
-    IndexOutput scorerTempOut =
-        segmentWriteState.directory.createTempOutput(
-            data.getName(), "dedup-scorer", segmentWriteState.context);
-    IndexInput scorerTempIn = null;
-    try {
-      DocsWithFieldSet docsWithField = new DocsWithFieldSet();
-      int count = writeMergedVectorsToTemp(fieldInfo, mergeState, scorerTempOut, docsWithField);
-      CodecUtil.writeFooter(scorerTempOut);
-      IOUtils.close(scorerTempOut);
-
-      // Pass 2: dedup from the closed temp file.
-      if (count > 0) {
-        try (IndexInput tempIn =
-            segmentWriteState.directory.openInput(
-                scorerTempOut.getName(), segmentWriteState.context)) {
-          dedupFromTempFile(fieldInfo, tempIn, count, maxDoc, docsWithField, byteSize);
+    for (DedupSub<?> sub = merger.next(); sub != null; sub = merger.next()) {
+      int dictOrd;
+      if (sub instanceof DedupAwareFloatSub das) {
+        // Lazy cache keyed on source dict ord. Each source dict ord is hashed at most once per
+        // merge. Dead dict entries (never referenced by any live doc) are never hashed — so the
+        // target dict doesn't accumulate unreachable vectors across merge cycles.
+        int srcDictOrd = das.sourceOrdToDict[sub.iteratorIndex()];
+        int cached = das.sourceDictOrdCache[srcDictOrd];
+        if (cached >= 0) {
+          dictOrd = cached;
+        } else {
+          dictOrd = addDedupAwareFloatVector(das.current(), mergeFieldIdx, sub.subIdx, srcDictOrd);
+          das.sourceDictOrdCache[srcDictOrd] = dictOrd;
         }
       } else {
-        pendingFields.add(
-            new PendingField(
-                fieldInfo,
-                0,
-                maxDoc,
-                docsWithField,
-                null,
-                dictSize,
-                dictDataOffset,
-                dictDimension,
-                dictEncoding));
+        float[] current = ((FloatDedupSub) sub).current();
+        dictOrd = addFloatMergeVector(current, mergeFieldIdx, sub.subIdx, sub.iteratorIndex());
       }
-
-      // Reopen with random-access hints for HNSW scorer construction.
-      scorerTempIn =
-          segmentWriteState.directory.openInput(
-              scorerTempOut.getName(),
-              IOContext.DEFAULT.withHints(
-                  FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM));
-
-      KnnVectorValues scorerValues =
-          switch (encoding) {
-            case FLOAT32 ->
-                new OffHeapFloatVectorValues.DenseOffHeapVectorValues(
-                    fieldInfo.getVectorDimension(),
-                    count,
-                    scorerTempIn,
-                    byteSize,
-                    vectorsScorer,
-                    fieldInfo.getVectorSimilarityFunction());
-            case BYTE ->
-                new OffHeapByteVectorValues.DenseOffHeapVectorValues(
-                    fieldInfo.getVectorDimension(),
-                    count,
-                    scorerTempIn,
-                    byteSize,
-                    vectorsScorer,
-                    fieldInfo.getVectorSimilarityFunction());
-          };
-
-      RandomVectorScorerSupplier supplier =
-          vectorsScorer.getRandomVectorScorerSupplier(
-              fieldInfo.getVectorSimilarityFunction(), scorerValues);
-
-      final int finalCount = count;
-      final IndexInput finalTempIn = scorerTempIn;
-      final String tempFileName = scorerTempOut.getName();
-      scorerTempIn = null; // ownership transferred
-      return new CloseableRandomVectorScorerSupplier() {
-        @Override
-        public UpdateableRandomVectorScorer scorer() throws IOException {
-          return supplier.scorer();
-        }
-
-        @Override
-        public RandomVectorScorerSupplier copy() throws IOException {
-          return supplier.copy();
-        }
-
-        @Override
-        public int totalVectorCount() {
-          return finalCount;
-        }
-
-        @Override
-        public void close() throws IOException {
-          IOUtils.close(finalTempIn);
-          IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, tempFileName);
-        }
-      };
-    } catch (Throwable t) {
-      IOUtils.closeWhileSuppressingExceptions(t, scorerTempIn, scorerTempOut);
-      IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, scorerTempOut.getName());
-      throw t;
-    }
-  }
-
-  /**
-   * Pass 2 of the two-pass merge. Reads vectors from a closed temp file, hashes and deduplicates
-   * them against the dictionary, and builds the ordToDict mapping.
-   *
-   * <p>Phase A (dict in read mode): scans all vectors, resolves each to a dictOrd via hash lookup
-   * and byte-for-byte verification. New unique vectors are assigned dictOrds but not yet written.
-   *
-   * <p>Phase B (dict in write mode): seeks to each new unique vector in the temp file and appends
-   * it to the dictionary. Only new vectors are read — duplicates are skipped.
-   *
-   * <p>The dict temp file is toggled once per field (read for phase A, write for phase B), not per
-   * vector.
-   */
-  private void dedupFromTempFile(
-      FieldInfo fieldInfo,
-      IndexInput tempIn,
-      int count,
-      int maxDoc,
-      DocsWithFieldSet docsWithField,
-      int byteSize)
-      throws IOException {
-    int[] ordToDict = new int[count];
-    int dictSizeBefore = dictSize;
-
-    // Phase A: dict in read mode — hash, dedup, build ordToDict.
-    IndexInput dictIn = getDictReadHandle();
-    // Temp-file indices of new unique vectors (for phase B writes). Sized to count as upper bound.
-    int numNew = 0;
-    int[] newVectorTempIndices = new int[count];
-
-    for (int i = 0; i < count; i++) {
-      tempIn.seek((long) i * byteSize);
-      tempIn.readBytes(vectorBytes, 0, byteSize);
-      long hash = hashBytes(vectorBytes, byteSize);
-
-      int dictOrd = -1;
-      for (int probe = 0; ; probe++) {
-        long probeHash = hash + probe;
-        int existing = hashToOrd.getOrDefault(probeHash, -1);
-        if (existing < 0) {
-          // New unique vector
-          dictOrd = dictSize++;
-          hashToOrd.put(probeHash, dictOrd);
-          newVectorTempIndices[numNew++] = i;
-          break;
-        }
-        // Hash hit — verify byte-for-byte equality
-        IndexInput verifySource;
-        if (existing >= dictSizeBefore) {
-          // Candidate was added by this field — read from temp file
-          tempIn.seek((long) newVectorTempIndices[existing - dictSizeBefore] * byteSize);
-          verifySource = tempIn;
-        } else {
-          // Candidate from a previous field — read from dict temp file
-          dictIn.seek((long) existing * byteSize);
-          verifySource = dictIn;
-        }
-        verifySource.readBytes(compareBytes, 0, byteSize);
-        if (Arrays.equals(vectorBytes, 0, byteSize, compareBytes, 0, byteSize)) {
-          dictOrd = existing;
-          break;
-        }
-        // Hash collision — continue probing
+      if (count == ordToDictTmp.length) {
+        ordToDictTmp = ArrayUtil.grow(ordToDictTmp);
       }
-      ordToDict[i] = dictOrd;
+      ordToDictTmp[count++] = dictOrd;
+      docsWithField.add(sub.mappedDocID);
     }
 
-    // Phase B: dict in write mode — append new unique vectors.
-    ensureDictWritable();
-    for (int n = 0; n < numNew; n++) {
-      tempIn.seek((long) newVectorTempIndices[n] * byteSize);
-      tempIn.readBytes(vectorBytes, 0, byteSize);
-      dictTempOut.writeBytes(vectorBytes, 0, byteSize);
-    }
-
+    int[] ordToDict = count == 0 ? null : ArrayUtil.copyOfSubArray(ordToDictTmp, 0, count);
     pendingFields.add(
         new PendingField(
             fieldInfo,
@@ -481,173 +352,432 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
             dictEncoding));
   }
 
-  /**
-   * Serialize a vector to its raw byte representation. Reuses the {@link #vectorBytes} buffer. The
-   * returned array is {@link #vectorBytes} — callers must consume it before the next call.
-   */
-  private byte[] vectorToBytes(KnnVectorValues values, int index) throws IOException {
-    if (values instanceof FloatVectorValues fv) {
-      float[] vec = fv.vectorValue(index);
-      ByteBuffer buf = ByteBuffer.wrap(vectorBytes).order(ByteOrder.LITTLE_ENDIAN);
-      buf.asFloatBuffer().put(vec);
-    } else {
-      byte[] vec = ((ByteVectorValues) values).vectorValue(index);
-      System.arraycopy(vec, 0, vectorBytes, 0, vectorByteSize);
-    }
-    return vectorBytes;
-  }
+  private void mergeByteField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
+    int maxDoc = segmentWriteState.segmentInfo.maxDoc();
+    int mergeFieldIdx = mergeFieldSubs.size();
+    List<DedupSub<?>> subs = new ArrayList<>();
+    mergeFieldSubs.add(subs);
+    buildByteSubs(subs, fieldInfo, mergeState);
 
-  // ---- Dictionary management ----
-
-  private void initDict(FieldInfo fieldInfo) throws IOException {
-    int dim = fieldInfo.getVectorDimension();
-    VectorEncoding enc = fieldInfo.getVectorEncoding();
-
-    // Reuse existing dictionary for cross-field dedup when dim/encoding match
-    if (dictTempName != null && dim == dictDimension && enc == dictEncoding) {
-      ensureDictWritable();
+    if (subs.isEmpty()) {
+      pendingFields.add(
+          new PendingField(
+              fieldInfo,
+              0,
+              maxDoc,
+              new DocsWithFieldSet(),
+              null,
+              dictSize,
+              dictDataOffset,
+              dictDimension,
+              dictEncoding));
       return;
     }
 
-    // Different dim/encoding or first field — start a new dictionary
-    if (dictTempName != null) {
-      copyDictTempToData();
+    DocIDMerger<DedupSub<?>> merger = DocIDMerger.of(subs, mergeState.needsIndexSort);
+    DocsWithFieldSet docsWithField = new DocsWithFieldSet();
+    int[] ordToDictTmp = new int[16];
+    int count = 0;
+
+    for (DedupSub<?> sub = merger.next(); sub != null; sub = merger.next()) {
+      int dictOrd;
+      if (sub instanceof DedupAwareByteSub das) {
+        int srcDictOrd = das.sourceOrdToDict[sub.iteratorIndex()];
+        int cached = das.sourceDictOrdCache[srcDictOrd];
+        if (cached >= 0) {
+          dictOrd = cached;
+        } else {
+          dictOrd = addDedupAwareByteVector(das.current(), mergeFieldIdx, sub.subIdx, srcDictOrd);
+          das.sourceDictOrdCache[srcDictOrd] = dictOrd;
+        }
+      } else {
+        byte[] current = ((ByteDedupSub) sub).current();
+        dictOrd = addByteMergeVector(current, mergeFieldIdx, sub.subIdx, sub.iteratorIndex());
+      }
+      if (count == ordToDictTmp.length) {
+        ordToDictTmp = ArrayUtil.grow(ordToDictTmp);
+      }
+      ordToDictTmp[count++] = dictOrd;
+      docsWithField.add(sub.mappedDocID);
     }
-    IOUtils.close(dictReadHandle);
-    dictReadHandle = null;
-    hashToOrd.clear();
-    dictSize = 0;
-    dictDataOffset = data.getFilePointer();
-    dictDimension = dim;
-    dictEncoding = enc;
-    vectorByteSize = dim * enc.byteSize;
-    vectorBytes = new byte[vectorByteSize];
-    compareBytes = new byte[vectorByteSize];
-    dictTempOut =
-        segmentWriteState.directory.createTempOutput(
-            data.getName(), "dedup-dict", segmentWriteState.context);
-    dictTempName = dictTempOut.getName();
+
+    int[] ordToDict = count == 0 ? null : ArrayUtil.copyOfSubArray(ordToDictTmp, 0, count);
+    pendingFields.add(
+        new PendingField(
+            fieldInfo,
+            count,
+            maxDoc,
+            docsWithField,
+            ordToDict,
+            dictSize,
+            dictDataOffset,
+            dictDimension,
+            dictEncoding));
   }
 
-  /**
-   * Add a vector (already in its in-memory representation) to the dictionary. Used by the flush
-   * path where vectors are in typed arrays.
-   */
-  private <T> int addToDict(T vec) throws IOException {
-    // Serialize to raw bytes for hashing and writing
-    if (vec instanceof float[] f) {
-      ByteBuffer buf = ByteBuffer.wrap(vectorBytes).order(ByteOrder.LITTLE_ENDIAN);
-      buf.asFloatBuffer().put(f);
-    } else if (vec instanceof byte[] b) {
-      System.arraycopy(b, 0, vectorBytes, 0, vectorByteSize);
-    }
-    return addToDictFromBytes(vectorBytes);
-  }
+  // ---- Per-vector merge helpers (shared between generic per-doc and dedup-aware lazy paths) ----
 
   /**
-   * Add a vector (as raw bytes) to the dictionary. Used by the flush path only. Collision
-   * verification reads from the dict temp file, which requires toggling between read and write
-   * modes. This is acceptable during flush since the number of vectors is bounded by the indexing
-   * buffer size.
+   * Hash/probe/write/verify for a single float merge vector. Returns the target dict ord. Used by
+   * the generic per-doc merge loop for non-dedup sources.
    */
-  private int addToDictFromBytes(byte[] rawBytes) throws IOException {
-    long hash = hashBytes(rawBytes, vectorByteSize);
-
+  private int addFloatMergeVector(float[] vec, int mergeFieldIdx, int subIdx, int sourceOrd)
+      throws IOException {
+    long hash = hashFloats(vec);
     for (int probe = 0; ; probe++) {
       long probeHash = hash + probe;
       int existing = hashToOrd.getOrDefault(probeHash, -1);
       if (existing < 0) {
-        ensureDictWritable();
         int dictOrd = dictSize++;
         hashToOrd.put(probeHash, dictOrd);
-        dictTempOut.writeBytes(rawBytes, 0, vectorByteSize);
+        writeFloatsToData(vec);
+        recordMergeSource(dictOrd, mergeFieldIdx, subIdx, sourceOrd);
         return dictOrd;
       }
-      // Hash hit — verify equality by reading from dict temp file
-      IndexInput reader = getDictReadHandle();
-      reader.seek((long) existing * vectorByteSize);
-      reader.readBytes(compareBytes, 0, vectorByteSize);
-      if (Arrays.equals(rawBytes, 0, vectorByteSize, compareBytes, 0, vectorByteSize)) {
+      float[] candidate = (float[]) dictSourceVector(existing);
+      if (Arrays.equals(vec, candidate)) {
         return existing;
       }
-      // Collision — continue probing
+    }
+  }
+
+  /** Byte-encoded mirror of {@link #addFloatMergeVector(float[], int, int, int)}. */
+  private int addByteMergeVector(byte[] vec, int mergeFieldIdx, int subIdx, int sourceOrd)
+      throws IOException {
+    long hash = hashBytes(vec, vec.length);
+    for (int probe = 0; ; probe++) {
+      long probeHash = hash + probe;
+      int existing = hashToOrd.getOrDefault(probeHash, -1);
+      if (existing < 0) {
+        int dictOrd = dictSize++;
+        hashToOrd.put(probeHash, dictOrd);
+        data.writeBytes(vec, 0, vec.length);
+        recordMergeSource(dictOrd, mergeFieldIdx, subIdx, sourceOrd);
+        return dictOrd;
+      }
+      byte[] candidate = (byte[]) dictSourceVector(existing);
+      if (Arrays.equals(vec, candidate)) {
+        return existing;
+      }
     }
   }
 
   /**
-   * Single-pass 64-bit hash over raw bytes. Combines two independent 32-bit hashes (polynomial and
-   * FNV-1a) computed in one loop, avoiding the need to iterate the data twice.
+   * Hash/probe/write/verify for a float vector coming from a {@link DedupAwareFloatSub}. On a hash
+   * hit, first inspect whether the candidate was contributed by the <em>same</em> source sub:
+   *
+   * <ul>
+   *   <li>Same sub, same {@code srcDictOrd} → identical vector (source format guarantees distinct
+   *       source dict ords correspond to distinct vectors). Return the candidate's target ord
+   *       without fetching either vector's bytes.
+   *   <li>Same sub, different {@code srcDictOrd} → guaranteed-distinct vector. Continue probing
+   *       without fetching either vector's bytes.
+   *   <li>Cross-sub (different sub, or flush source) → byte equality via {@link
+   *       #dictSourceVector(int)} (correctness is required for cross-segment dedup).
+   * </ul>
+   */
+  private int addDedupAwareFloatVector(float[] vec, int mergeFieldIdx, int subIdx, int srcDictOrd)
+      throws IOException {
+    long hash = hashFloats(vec);
+    long curHigh = packedMergeHigh32(mergeFieldIdx, subIdx);
+    for (int probe = 0; ; probe++) {
+      long probeHash = hash + probe;
+      int existing = hashToOrd.getOrDefault(probeHash, -1);
+      if (existing < 0) {
+        int dictOrd = dictSize++;
+        hashToOrd.put(probeHash, dictOrd);
+        writeFloatsToData(vec);
+        recordMergeSource(dictOrd, mergeFieldIdx, subIdx, srcDictOrd);
+        return dictOrd;
+      }
+      long candSrc = dictSources[existing];
+      if ((candSrc >>> 32) == curHigh) {
+        // Same sub — int-ord comparison is authoritative.
+        if ((int) candSrc == srcDictOrd) {
+          return existing;
+        }
+        // Different srcDictOrd within same sub → distinct vector. Continue probing.
+      } else {
+        // Cross-sub / flush — full byte equality.
+        float[] candidate = (float[]) dictSourceVector(existing);
+        if (Arrays.equals(vec, candidate)) {
+          return existing;
+        }
+      }
+    }
+  }
+
+  /** Byte-encoded mirror of {@link #addDedupAwareFloatVector(float[], int, int, int)}. */
+  private int addDedupAwareByteVector(byte[] vec, int mergeFieldIdx, int subIdx, int srcDictOrd)
+      throws IOException {
+    long hash = hashBytes(vec, vec.length);
+    long curHigh = packedMergeHigh32(mergeFieldIdx, subIdx);
+    for (int probe = 0; ; probe++) {
+      long probeHash = hash + probe;
+      int existing = hashToOrd.getOrDefault(probeHash, -1);
+      if (existing < 0) {
+        int dictOrd = dictSize++;
+        hashToOrd.put(probeHash, dictOrd);
+        data.writeBytes(vec, 0, vec.length);
+        recordMergeSource(dictOrd, mergeFieldIdx, subIdx, srcDictOrd);
+        return dictOrd;
+      }
+      long candSrc = dictSources[existing];
+      if ((candSrc >>> 32) == curHigh) {
+        if ((int) candSrc == srcDictOrd) {
+          return existing;
+        }
+      } else {
+        byte[] candidate = (byte[]) dictSourceVector(existing);
+        if (Arrays.equals(vec, candidate)) {
+          return existing;
+        }
+      }
+    }
+  }
+
+  /**
+   * Return the high 32 bits of the packed source descriptor for a merge-contributed dict ord from
+   * {@code (mergeFieldIdx, subIdx)}. Two merge entries share these bits iff they came from the same
+   * sub. A flush entry has top bit 0 and so can never match a merge entry here.
+   */
+  private static long packedMergeHigh32(int mergeFieldIdx, int subIdx) {
+    return (1L << 31) | ((long) mergeFieldIdx << 16) | (subIdx & 0xFFFFL);
+  }
+
+  // ---- Source lookup + verification helpers ----
+
+  /**
+   * Resolve {@code dictOrd}'s source vector as a typed array ({@code float[]} or {@code byte[]}).
+   * For flush-contributed ords, this is the on-heap {@link FieldWriter#vectors} entry. For merge-
+   * contributed ords, this is a random-access fetch through the sub's dedicated {@code
+   * verifyValues} reader (separate from the iteration reader, so there is no aliasing with the
+   * iterator's current buffer).
+   */
+  private Object dictSourceVector(int dictOrd) throws IOException {
+    long src = dictSources[dictOrd];
+    if ((src >>> 63) == 0) {
+      int candidateFieldIdx = (int) (src >>> 32);
+      int candidateInFieldOrd = (int) src;
+      return fields.get(candidateFieldIdx).vectors.get(candidateInFieldOrd);
+    } else {
+      int mergeFieldIdx = (int) ((src >>> 48) & 0x7FFFL);
+      int subIdx = (int) ((src >>> 32) & 0xFFFFL);
+      int sourceOrd = (int) src;
+      return mergeFieldSubs.get(mergeFieldIdx).get(subIdx).valueAt(sourceOrd);
+    }
+  }
+
+  /** Typed equality between two same-encoding vector arrays. */
+  private boolean typedVectorsEqual(Object a, Object b) {
+    if (a instanceof float[] af) {
+      return Arrays.equals(af, (float[]) b);
+    } else if (a instanceof byte[] ab) {
+      return Arrays.equals(ab, (byte[]) b);
+    } else {
+      throw new AssertionError("Unexpected vector type: " + a.getClass());
+    }
+  }
+
+  /** Write a vector directly to {@link #data} without an intermediate {@code byte[]}. */
+  private void writeVectorToData(Object vec) throws IOException {
+    if (vec instanceof float[] f) {
+      writeFloatsToData(f);
+    } else if (vec instanceof byte[] b) {
+      data.writeBytes(b, 0, b.length);
+    } else {
+      throw new AssertionError("Unexpected vector type: " + vec.getClass());
+    }
+  }
+
+  /**
+   * Write a float vector to {@link #data} via the reusable {@link #floatWriteBuffer}. This mirrors
+   * {@code Lucene99FlatVectorsWriter.writeFloat32Vectors}: each call rewrites the buffer in place
+   * and issues a single bulk {@link IndexOutput#writeBytes(byte[], int, int)}. Faster than a
+   * per-element {@code data.writeInt(Float.floatToRawIntBits(f))} loop, particularly on buffered
+   * outputs where each virtual call carries non-trivial overhead.
+   */
+  private void writeFloatsToData(float[] vec) throws IOException {
+    floatWriteBuffer.asFloatBuffer().put(vec);
+    data.writeBytes(floatWriteBuffer.array(), floatWriteBuffer.array().length);
+  }
+
+  // ---- Shared dict state + source tracking ----
+
+  private void initDict(FieldInfo fieldInfo) {
+    int dim = fieldInfo.getVectorDimension();
+    VectorEncoding enc = fieldInfo.getVectorEncoding();
+
+    if (dictInitialized && dim == dictDimension && enc == dictEncoding) {
+      return;
+    }
+
+    hashToOrd.clear();
+    dictSources = null;
+    mergeFieldSubs.clear();
+    dictSize = 0;
+    dictDataOffset = data.getFilePointer();
+    dictDimension = dim;
+    dictEncoding = enc;
+    // Allocate a reusable little-endian byte buffer for float writes (see writeFloatsToData).
+    // Null for byte-encoded groups since those write through data.writeBytes directly.
+    floatWriteBuffer =
+        (enc == VectorEncoding.FLOAT32)
+            ? ByteBuffer.allocate(dim * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN)
+            : null;
+    dictInitialized = true;
+  }
+
+  /** Record a flush-contributed source in {@link #dictSources} (top bit 0). */
+  private void recordFlushSource(int dictOrd, int fieldIdx, int inFieldOrd) {
+    ensureDictSourcesCapacity(dictOrd);
+    dictSources[dictOrd] = ((long) fieldIdx << 32) | (inFieldOrd & 0xFFFFFFFFL);
+  }
+
+  /** Record a merge-contributed source in {@link #dictSources} (top bit 1). */
+  private void recordMergeSource(int dictOrd, int mergeFieldIdx, int subIdx, int sourceOrd) {
+    ensureDictSourcesCapacity(dictOrd);
+    if (mergeFieldIdx >= (1 << 15) || subIdx >= (1 << 16)) {
+      throw new IllegalStateException(
+          "Too many merge fields or source segments: mergeFieldIdx="
+              + mergeFieldIdx
+              + ", subIdx="
+              + subIdx);
+    }
+    dictSources[dictOrd] =
+        (1L << 63)
+            | ((long) mergeFieldIdx << 48)
+            | ((long) subIdx << 32)
+            | (sourceOrd & 0xFFFFFFFFL);
+  }
+
+  private void ensureDictSourcesCapacity(int dictOrd) {
+    if (dictSources == null || dictOrd >= dictSources.length) {
+      int newLen = dictSources == null ? 16 : ArrayUtil.oversize(dictOrd + 1, Long.BYTES);
+      long[] grown = new long[newLen];
+      if (dictSources != null) {
+        System.arraycopy(dictSources, 0, grown, 0, dictSources.length);
+      }
+      dictSources = grown;
+    }
+  }
+
+  /**
+   * Build one {@link DedupSub} per source segment that has float values for this field, populating
+   * the passed-in {@code subs} list. For sources that are {@link DedupFlatVectorsReader}s with
+   * {@code ordToDict != null}, construct a {@link DedupAwareFloatSub} with a lazy cache keyed on
+   * source dict ord. No precompute — each source dict ord is hashed on-demand the first time a live
+   * doc references it, so dead vectors in the source's dictionary are naturally dropped.
+   */
+  private void buildFloatSubs(List<DedupSub<?>> subs, FieldInfo fieldInfo, MergeState mergeState)
+      throws IOException {
+    int subIdx = 0;
+    for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
+      if (!KnnVectorsWriter.MergedVectorValues.hasVectorValues(
+          mergeState.fieldInfos[i], fieldInfo.name)) {
+        continue;
+      }
+      var reader = mergeState.knnVectorsReaders[i];
+      if (reader == null) continue;
+      FloatVectorValues values = reader.getFloatVectorValues(fieldInfo.name);
+      if (values == null) continue;
+
+      if (reader instanceof DedupFlatVectorsReader dedupReader) {
+        int[] sourceOrdToDict = dedupReader.getOrdToDict(fieldInfo.name);
+        if (sourceOrdToDict != null) {
+          FloatVectorValues dictVerifyValues = dedupReader.getDictFloatVectorValues(fieldInfo.name);
+          subs.add(
+              new DedupAwareFloatSub(
+                  subIdx++,
+                  mergeState.docMaps[i],
+                  values,
+                  dictVerifyValues,
+                  sourceOrdToDict,
+                  dictVerifyValues.size()));
+          continue;
+        }
+      }
+
+      // Generic path: separate verify handle keeps random-access verification reads from aliasing
+      // the iteration buffer within the same sub.
+      FloatVectorValues verifyValues = values.copy();
+      subs.add(new FloatDedupSub(subIdx++, mergeState.docMaps[i], values, verifyValues));
+    }
+  }
+
+  /** Byte-encoded mirror of {@link #buildFloatSubs}. */
+  private void buildByteSubs(List<DedupSub<?>> subs, FieldInfo fieldInfo, MergeState mergeState)
+      throws IOException {
+    int subIdx = 0;
+    for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
+      if (!KnnVectorsWriter.MergedVectorValues.hasVectorValues(
+          mergeState.fieldInfos[i], fieldInfo.name)) {
+        continue;
+      }
+      var reader = mergeState.knnVectorsReaders[i];
+      if (reader == null) continue;
+      ByteVectorValues values = reader.getByteVectorValues(fieldInfo.name);
+      if (values == null) continue;
+
+      if (reader instanceof DedupFlatVectorsReader dedupReader) {
+        int[] sourceOrdToDict = dedupReader.getOrdToDict(fieldInfo.name);
+        if (sourceOrdToDict != null) {
+          ByteVectorValues dictVerifyValues = dedupReader.getDictByteVectorValues(fieldInfo.name);
+          subs.add(
+              new DedupAwareByteSub(
+                  subIdx++,
+                  mergeState.docMaps[i],
+                  values,
+                  dictVerifyValues,
+                  sourceOrdToDict,
+                  dictVerifyValues.size()));
+          continue;
+        }
+      }
+
+      ByteVectorValues verifyValues = values.copy();
+      subs.add(new ByteDedupSub(subIdx++, mergeState.docMaps[i], values, verifyValues));
+    }
+  }
+
+  /**
+   * 64-bit hash over a float vector. Operates directly on {@link Float#floatToRawIntBits(float)}
+   * with no byte materialization. The on-disk byte layout of each float (little-endian 4-byte int
+   * via {@link IndexOutput#writeInt(int)}) yields identical hash input to a byte-oriented FNV
+   * computation, so we produce the same high-quality 64-bit digest without touching bytes.
+   */
+  static long hashFloats(float[] vec) {
+    int h1 = 1;
+    int h2 = 0x811c9dc5;
+    for (float f : vec) {
+      int bits = Float.floatToRawIntBits(f);
+      h1 = 31 * h1 + bits;
+      // FNV-1a on the 4 little-endian bytes of `bits`.
+      h2 = (h2 ^ (bits & 0xff)) * 0x01000193;
+      h2 = (h2 ^ ((bits >>> 8) & 0xff)) * 0x01000193;
+      h2 = (h2 ^ ((bits >>> 16) & 0xff)) * 0x01000193;
+      h2 = (h2 ^ ((bits >>> 24) & 0xff)) * 0x01000193;
+    }
+    return ((long) h1 << 32) | (h2 & 0xFFFFFFFFL);
+  }
+
+  /**
+   * 64-bit hash over a byte vector. Mirror of {@link #hashFloats(float[])} for byte-encoded
+   * vectors. Since a single writer instance processes one encoding per shared-dict group, the two
+   * hash functions don't need to agree on the same input.
    */
   static long hashBytes(byte[] bytes, int length) {
-    // Polynomial hash (same algorithm as Arrays.hashCode but on raw bytes in 4-byte groups)
     int h1 = 1;
-    // FNV-1a hash
     int h2 = 0x811c9dc5;
-
     for (int i = 0; i < length; i++) {
       int b = bytes[i] & 0xFF;
-      // FNV-1a step
       h2 = (h2 ^ b) * 0x01000193;
-      // Accumulate into polynomial hash in 4-byte groups (matching Float.floatToIntBits layout)
       if ((i & 3) == 0) {
         h1 = 31 * h1;
       }
       h1 += b << ((i & 3) * 8);
     }
-
     return ((long) h1 << 32) | (h2 & 0xFFFFFFFFL);
-  }
-
-  // ---- Dictionary temp file management ----
-
-  /** Ensure the dictionary temp file is open for writing. */
-  private void ensureDictWritable() throws IOException {
-    if (dictReadHandle != null) {
-      IOUtils.close(dictReadHandle);
-      dictReadHandle = null;
-      // Copy existing content to a new temp file to resume writing
-      String oldName = dictTempName;
-      dictTempOut =
-          segmentWriteState.directory.createTempOutput(
-              data.getName(), "dedup-dict", segmentWriteState.context);
-      dictTempName = dictTempOut.getName();
-      try (IndexInput in =
-          segmentWriteState.directory.openInput(oldName, segmentWriteState.context)) {
-        dictTempOut.copyBytes(in, in.length() - CodecUtil.footerLength());
-      }
-      IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, oldName);
-    }
-  }
-
-  /** Open the dictionary temp file for reading (closes the writer first). */
-  private IndexInput getDictReadHandle() throws IOException {
-    if (dictReadHandle == null) {
-      CodecUtil.writeFooter(dictTempOut);
-      IOUtils.close(dictTempOut);
-      dictTempOut = null;
-      dictReadHandle =
-          segmentWriteState.directory.openInput(dictTempName, segmentWriteState.context);
-    }
-    return dictReadHandle;
-  }
-
-  /** Copy dictionary vectors from temp file to the main data file. */
-  private void copyDictTempToData() throws IOException {
-    if (dictTempName == null) return;
-    if (dictReadHandle != null) {
-      IOUtils.close(dictReadHandle);
-      dictReadHandle = null;
-    } else if (dictTempOut != null) {
-      CodecUtil.writeFooter(dictTempOut);
-      IOUtils.close(dictTempOut);
-      dictTempOut = null;
-    }
-    try (IndexInput in =
-        segmentWriteState.directory.openInput(dictTempName, segmentWriteState.context)) {
-      data.copyBytes(in, in.length() - CodecUtil.footerLength());
-    }
-    IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, dictTempName);
-    dictTempName = null;
   }
 
   // ---- Finish / close ----
@@ -657,14 +787,9 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
     if (finished) throw new IllegalStateException("already finished");
     finished = true;
 
-    // Copy last field's dictionary from temp to data
-    if (dictTempName != null) {
-      copyDictTempToData();
-    }
-    IOUtils.close(dictReadHandle);
-    dictReadHandle = null;
+    // All dictionary bytes are already in `data`. Release cached merge subs.
+    mergeFieldSubs.clear();
 
-    // Write per-field ordToDict mappings to data
     long[] mapOffsets = new long[pendingFields.size()];
     long[] mapLengths = new long[pendingFields.size()];
     for (int i = 0; i < pendingFields.size(); i++) {
@@ -678,7 +803,6 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
       mapLengths[i] = data.getFilePointer() - mapOffsets[i];
     }
 
-    // Write per-field metadata to meta, OrdToDoc DISI data to data
     for (int i = 0; i < pendingFields.size(); i++) {
       PendingField pf = pendingFields.get(i);
       meta.writeInt(pf.fieldInfo.number);
@@ -712,15 +836,16 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
       }
     }
     total += hashToOrd.size() * 16L;
+    if (dictSources != null) {
+      total += (long) dictSources.length * Long.BYTES;
+    }
     return total;
   }
 
   @Override
   public void close() throws IOException {
-    IOUtils.close(meta, data, dictReadHandle, dictTempOut);
-    if (dictTempName != null) {
-      IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.directory, dictTempName);
-    }
+    mergeFieldSubs.clear();
+    IOUtils.close(meta, data);
   }
 
   // ---- Inner types ----
@@ -739,6 +864,168 @@ final class DedupFlatVectorsWriter extends FlatVectorsWriter {
       long dictDataOffset,
       int dictDimension,
       VectorEncoding dictEncoding) {}
+
+  /**
+   * One sub-reader for the merge path, wrapping a per-segment vector values handle plus a separate
+   * {@code verifyValues} handle used exclusively for random-access collision verification reads.
+   * The two handles share the underlying file but maintain their own buffers, so verification
+   * against a candidate vector from the same sub never corrupts the iteration buffer.
+   */
+  private abstract static class DedupSub<V> extends DocIDMerger.Sub {
+    final int subIdx;
+    final KnnVectorValues.DocIndexIterator iterator;
+
+    DedupSub(int subIdx, MergeState.DocMap docMap, KnnVectorValues values) {
+      super(docMap);
+      this.subIdx = subIdx;
+      this.iterator = values.iterator();
+      assert iterator.docID() == -1;
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      return iterator.nextDoc();
+    }
+
+    int iteratorIndex() {
+      return iterator.index();
+    }
+
+    /**
+     * Random-access fetch through the dedicated verification handle; never returns a buffer aliased
+     * with the iteration buffer.
+     */
+    abstract V valueAt(int sourceOrd) throws IOException;
+  }
+
+  private static final class FloatDedupSub extends DedupSub<float[]> {
+    private final FloatVectorValues values;
+    private final FloatVectorValues verifyValues;
+
+    FloatDedupSub(
+        int subIdx,
+        MergeState.DocMap docMap,
+        FloatVectorValues values,
+        FloatVectorValues verifyValues) {
+      super(subIdx, docMap, values);
+      this.values = values;
+      this.verifyValues = verifyValues;
+    }
+
+    float[] current() throws IOException {
+      return values.vectorValue(iterator.index());
+    }
+
+    @Override
+    float[] valueAt(int sourceOrd) throws IOException {
+      return verifyValues.vectorValue(sourceOrd);
+    }
+  }
+
+  /**
+   * Specialized float sub for sources that are themselves {@link DedupFlatVectorsReader}s. Carries
+   * the source's {@code ordToDict} mapping, a lazy per-source-dict-ord cache of resolved target
+   * dict ords, and a separate dict-level verify handle used when a different merge sub has a hash
+   * collision with a vector this sub previously contributed.
+   *
+   * <p>The cache is populated on-demand during per-doc iteration: each unique source dict ord is
+   * hashed at most once regardless of how many live docs reference it. Source dict ords that are
+   * never referenced by any live doc are never hashed, so dead vectors in the source's dictionary
+   * are naturally dropped during merge.
+   *
+   * <p>Within the same sub, vector-equality on hash collision is decided purely by comparing {@link
+   * #sourceOrdToDict}{@code [currentDocOrd]} against the candidate's recorded source dict ord — the
+   * source format guarantees distinct source dict ords correspond to distinct vectors, so
+   * byte-level comparison is unnecessary. Cross-sub collisions still fall back to byte equality,
+   * using {@link #dictVerifyValues} (backed by the source's dictionary slice) to read the candidate
+   * vector by its source dict ord.
+   */
+  private static final class DedupAwareFloatSub extends DedupSub<float[]> {
+    final int[] sourceOrdToDict;
+    final int[] sourceDictOrdCache;
+    private final FloatVectorValues iterValues;
+    private final FloatVectorValues dictVerifyValues;
+
+    DedupAwareFloatSub(
+        int subIdx,
+        MergeState.DocMap docMap,
+        FloatVectorValues iterValues,
+        FloatVectorValues dictVerifyValues,
+        int[] sourceOrdToDict,
+        int sourceDictSize) {
+      super(subIdx, docMap, iterValues);
+      this.iterValues = iterValues;
+      this.dictVerifyValues = dictVerifyValues;
+      this.sourceOrdToDict = sourceOrdToDict;
+      this.sourceDictOrdCache = new int[sourceDictSize];
+      Arrays.fill(this.sourceDictOrdCache, -1);
+    }
+
+    float[] current() throws IOException {
+      return iterValues.vectorValue(iterator.index());
+    }
+
+    @Override
+    float[] valueAt(int sourceDictOrd) throws IOException {
+      return dictVerifyValues.vectorValue(sourceDictOrd);
+    }
+  }
+
+  private static final class ByteDedupSub extends DedupSub<byte[]> {
+    private final ByteVectorValues values;
+    private final ByteVectorValues verifyValues;
+
+    ByteDedupSub(
+        int subIdx,
+        MergeState.DocMap docMap,
+        ByteVectorValues values,
+        ByteVectorValues verifyValues) {
+      super(subIdx, docMap, values);
+      this.values = values;
+      this.verifyValues = verifyValues;
+    }
+
+    byte[] current() throws IOException {
+      return values.vectorValue(iterator.index());
+    }
+
+    @Override
+    byte[] valueAt(int sourceOrd) throws IOException {
+      return verifyValues.vectorValue(sourceOrd);
+    }
+  }
+
+  /** Byte-encoded mirror of {@link DedupAwareFloatSub}. */
+  private static final class DedupAwareByteSub extends DedupSub<byte[]> {
+    final int[] sourceOrdToDict;
+    final int[] sourceDictOrdCache;
+    private final ByteVectorValues iterValues;
+    private final ByteVectorValues dictVerifyValues;
+
+    DedupAwareByteSub(
+        int subIdx,
+        MergeState.DocMap docMap,
+        ByteVectorValues iterValues,
+        ByteVectorValues dictVerifyValues,
+        int[] sourceOrdToDict,
+        int sourceDictSize) {
+      super(subIdx, docMap, iterValues);
+      this.iterValues = iterValues;
+      this.dictVerifyValues = dictVerifyValues;
+      this.sourceOrdToDict = sourceOrdToDict;
+      this.sourceDictOrdCache = new int[sourceDictSize];
+      Arrays.fill(this.sourceDictOrdCache, -1);
+    }
+
+    byte[] current() throws IOException {
+      return iterValues.vectorValue(iterator.index());
+    }
+
+    @Override
+    byte[] valueAt(int sourceDictOrd) throws IOException {
+      return dictVerifyValues.vectorValue(sourceDictOrd);
+    }
+  }
 
   /** Buffers vectors in memory during indexing (flush path only). */
   private abstract static class FieldWriter<T> extends FlatFieldVectorsWriter<T> {
